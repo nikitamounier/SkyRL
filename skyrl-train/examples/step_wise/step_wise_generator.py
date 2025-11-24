@@ -8,6 +8,7 @@ import skyrl_gym
 from typing import List, Dict, Any, Optional, Union, Tuple
 from tqdm.asyncio import tqdm
 from dataclasses import dataclass
+from loguru import logger
 
 from skyrl_train.generators.base import GeneratorInput, GeneratorOutput, TrajectoryID
 from skyrl_train.generators.skyrl_gym_generator import SkyRLGymGenerator
@@ -107,12 +108,21 @@ class StepWiseGenerator(SkyRLGymGenerator):
         # init() returns the first prompt to be given to the model, and optional metadata dict
         chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
 
-        input_ids = self.tokenizer.apply_chat_template(
+
+        input_ids, expanded_chat_history = self._prepare_prompt_tokens(
             chat_history,
+            env_extras,
             add_generation_prompt=True,
-            tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
         )
+        if expanded_chat_history is not chat_history:
+            chat_history = expanded_chat_history
+
+        single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
+        if retokenize_chat_history and single_modalities_batches:
+            logger.warning(
+                "Modalities with retokenize_chat_history in StepWiseGenerator are not yet supported; proceeding without modality batches."
+            )
+            single_modalities_batches = None
 
         # Accumulate per-step rewards. Format: (reward, response_end_token_idx)
         per_step_rewards: List[Tuple[float, int]] = []
@@ -121,17 +131,20 @@ class StepWiseGenerator(SkyRLGymGenerator):
         while not done:
 
             if retokenize_chat_history:
-                input_ids = self.tokenizer.apply_chat_template(
+                input_ids, expanded_chat_history = self._prepare_prompt_tokens(
                     chat_history,
+                    env_extras,
                     add_generation_prompt=True,
-                    # chat_template=None,
-                    tokenize=True,
-                    **self.generator_cfg.chat_template_kwargs,
                 )
+                if expanded_chat_history is not chat_history:
+                    chat_history = expanded_chat_history
 
             current_prompt_length = len(input_ids)
             engine_input = InferenceEngineInput(
-                prompt_token_ids=[input_ids], session_ids=[session_id], sampling_params=sampling_params
+                prompt_token_ids=[input_ids],
+                session_ids=[session_id],
+                sampling_params=sampling_params,
+                modalities_batches=single_modalities_batches,
             )
             engine_output = await self.inference_engine_client.generate(engine_input)
             output = engine_output["responses"][0]

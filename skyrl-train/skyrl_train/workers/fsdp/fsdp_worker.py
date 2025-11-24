@@ -77,6 +77,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 sequence_parallel_size=self.cfg.trainer.policy.sequence_parallel_size,
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
                 use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
+                modalities_config=self.cfg.trainer.modalities,
             )
             # in-place patch
             self._seq_parallel_monkey_patch(model=wrapped_model.model)
@@ -160,7 +161,21 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             return
         else:
             # Regular model without LoRA
-            params = self.model.model.state_dict()
+            params = {
+                name: tensor
+                for name, tensor in self.model.model.state_dict().items()
+                if "_modality_" not in name and not name.startswith("modalities.")
+            }
+
+        modality_params = []
+        modality_base_module = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
+        modalities_manager = getattr(modality_base_module, "modalities_manager", None)
+        if modalities_manager is not None:
+            for modality_id, role, module in modalities_manager.iter_handler_modules():
+                if not isinstance(module, torch.nn.Module):
+                    continue
+                for sub_name, sub_param in module.named_parameters():
+                    modality_params.append((f"modalities.{modality_id}.{role}.{sub_name}", sub_param))
 
         if not self.use_cuda_ipc:
             for name, param in params.items():
@@ -191,6 +206,24 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 if torch.distributed.get_rank() == 0:
                     await update_weight_task
                 torch.distributed.barrier()
+
+            for name, param in modality_params:
+                tensor = param.data.to(generator_dtype)
+                if torch.distributed.get_rank() == 0:
+                    update_weight_task = asyncio.create_task(
+                        inference_engine_client.update_named_weights(
+                            {
+                                "names": [name],
+                                "dtypes": [self.cfg.generator.model_dtype],
+                                "shapes": [list(param.shape)],
+                            }
+                        )
+                    )
+
+                await asyncio.to_thread(torch.distributed.broadcast, tensor, 0, self._model_update_group)
+                if torch.distributed.get_rank() == 0:
+                    await update_weight_task
+            torch.distributed.barrier()
         # CUDA IPC
         else:
             weights_update_request = {"names": [], "dtypes": [], "shapes": [], "extras": []}
@@ -256,6 +289,23 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             if len(weights_update_request["names"]) > 0 and torch.distributed.get_rank() == 0:
                 await asyncio.create_task(inference_engine_client.update_named_weights(weights_update_request))
                 torch.cuda.ipc_collect()
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+
+            if modality_params and torch.distributed.get_rank() == 0:
+                weights_update_request = {"names": [], "dtypes": [], "shapes": [], "extras": []}
+                for name, param in modality_params:
+                    tensor = param.data.to(generator_dtype).contiguous()
+                    from torch.multiprocessing.reductions import reduce_tensor
+
+                    ipc_handle = reduce_tensor(tensor)
+                    weights_update_request["names"].append(name)
+                    weights_update_request["dtypes"].append(self.cfg.generator.model_dtype)
+                    weights_update_request["shapes"].append(list(param.shape))
+                    weights_update_request["extras"].append({"ipc_handles": {get_physical_gpu_id(): ipc_handle}})
+                if weights_update_request["names"]:
+                    await asyncio.create_task(inference_engine_client.update_named_weights(weights_update_request))
+                    torch.cuda.ipc_collect()
             torch.distributed.barrier()
             torch.cuda.synchronize()
 
@@ -334,6 +384,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
                 init_value_head=self.cfg.trainer.policy.model.path == self.cfg.trainer.critic.model.path,
                 sequence_parallel_size=self.cfg.trainer.critic.sequence_parallel_size,
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
+                modalities_config=self.cfg.trainer.modalities,
             )
             self._seq_parallel_monkey_patch(model=critic, use_parent_class=True)
 
@@ -397,6 +448,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
                 bf16=self.cfg.trainer.bf16,
                 sequence_parallel_size=self.cfg.trainer.ref.sequence_parallel_size,
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
+                modalities_config=self.cfg.trainer.modalities,
             )
             self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

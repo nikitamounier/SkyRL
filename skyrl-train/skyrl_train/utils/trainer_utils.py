@@ -7,6 +7,7 @@ import os
 from loguru import logger
 from omegaconf import DictConfig
 import json
+import copy
 import torch
 import numpy as np
 from collections import defaultdict
@@ -396,6 +397,8 @@ def handle_replace_sampling(
         for uid in bad_uids:
             bad_indices.extend(uid2indices[uid])
 
+        modalities_metadata = generator_output.get("modalities_metadata")
+
         # Replace bad samples with good ones (modify in place because replacement_idx and bad_idx should not overlap)
         for bad_idx, replacement_idx in zip(bad_indices, replacement_indices):
             generator_output["prompt_token_ids"][bad_idx] = generator_output["prompt_token_ids"][replacement_idx].copy()
@@ -410,6 +413,17 @@ def handle_replace_sampling(
 
             if generator_output["rollout_logprobs"]:
                 generator_output["rollout_logprobs"][bad_idx] = generator_output["rollout_logprobs"][replacement_idx]
+
+            if modalities_metadata:
+                replacement_meta = modalities_metadata[replacement_idx]
+                if hasattr(replacement_meta, "clone"):
+                    try:
+                        replacement_meta = replacement_meta.clone()
+                    except TypeError:
+                        replacement_meta = copy.deepcopy(replacement_meta)
+                else:
+                    replacement_meta = copy.deepcopy(replacement_meta)
+                modalities_metadata[bad_idx] = replacement_meta
 
         # Update UIDs accordingly
         replaced_uids = uids.copy()
@@ -552,6 +566,19 @@ def filter_generator_output(output: GeneratorOutput, kept_indices: List[int]) ->
 
     if output.get("stop_reasons"):
         filtered["stop_reasons"] = [output["stop_reasons"][i] for i in kept_indices]
+
+    if output.get("modalities_metadata"):
+        filtered_metadata = []
+        for i in kept_indices:
+            metadata_item = output["modalities_metadata"][i]
+            if hasattr(metadata_item, "clone"):
+                try:
+                    filtered_metadata.append(metadata_item.clone())
+                    continue
+                except TypeError:
+                    pass
+            filtered_metadata.append(copy.deepcopy(metadata_item))
+        filtered["modalities_metadata"] = filtered_metadata
 
     return filtered
 

@@ -1,4 +1,5 @@
 import math
+import copy
 from skyrl_train.dataset.replay_buffer import Experience
 from typing import List, Dict
 from skyrl_train.training_batch import TrainingInputBatch
@@ -50,6 +51,9 @@ class BatchIterator:
     def batch_to_experience(batch: TrainingInputBatch):
         # TODO (sumanthrh): other keys are not permitted right now, can go into info
         # TODO: this conversion is hidden right now, might need to be surfaced in worker explicitly.
+        metadata = batch.metadata
+        if metadata is not None:
+            metadata = copy.deepcopy(metadata)
         exp = Experience(
             sequences=batch["sequences"],
             action_log_probs=batch["action_log_probs"],
@@ -66,6 +70,6 @@ class BatchIterator:
             # can be used to log metrics etc for micro-batches in the worker
             info={},
             # propagate metadata as is
-            metadata=batch.metadata,
+            metadata=metadata,
         )
         return exp

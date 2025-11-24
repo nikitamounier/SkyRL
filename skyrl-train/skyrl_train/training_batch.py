@@ -5,6 +5,7 @@ import torch
 from jaxtyping import Float, Integer
 import pickle
 import io
+import copy
 
 DictType = TypeVar("DictType")
 
@@ -38,13 +39,20 @@ class TensorBatch(dict, Generic[DictType]):
         selected_batch_data = {}
         for key in keys:
             selected_batch_data[key] = self[key]
-        selected_metadata = {}
+        indices = list(range(self._batch_size)) if self._batch_size is not None else []
+        subset_metadata = self._subset_metadata(indices)
         if metadata_keys is None:
-            selected_metadata = self.metadata
+            selected_metadata = subset_metadata
         else:
             selected_metadata = {}
-            for key in metadata_keys:
-                selected_metadata[key] = self.metadata[key]
+            if subset_metadata:
+                for key in metadata_keys:
+                    if key not in subset_metadata:
+                        raise KeyError(f"Metadata key `{key}` not found while selecting batch.")
+                    selected_metadata[key] = subset_metadata[key]
+            else:
+                for key in metadata_keys:
+                    raise KeyError(f"Metadata key `{key}` not found while selecting batch.")
         new_batch = self.__class__(selected_batch_data)
         new_batch.metadata = selected_metadata
         return new_batch
@@ -221,7 +229,8 @@ class TensorBatch(dict, Generic[DictType]):
                     # `None` values are not chunked
                     chunk_data[key] = value
             chunk = self.__class__(chunk_data)
-            chunk.metadata = self.metadata
+            end = min(i + chunk_size, self._batch_size)
+            chunk.metadata = self._subset_metadata(list(range(i, end)))
             chunks.append(chunk)
         return chunks
 
@@ -248,7 +257,8 @@ class TensorBatch(dict, Generic[DictType]):
                 # `None` values are not sliced
                 sliced_data[key] = value
         sliced_batch = self.__class__(sliced_data)
-        sliced_batch.metadata = self.metadata
+        indices = list(range(*slice_obj.indices(self._batch_size)))
+        sliced_batch.metadata = self._subset_metadata(indices)
         return sliced_batch
 
     def save(self, path: str):
@@ -284,7 +294,7 @@ class TensorBatch(dict, Generic[DictType]):
                 cat_data[key] = value
         metadata = shards[0].metadata
         cat_batch = cls(cat_data)
-        cat_batch.metadata = metadata
+        cat_batch.metadata = cls._concat_metadata(shards)
         return cat_batch
 
     def __len__(self) -> int:
@@ -316,6 +326,55 @@ class TensorBatch(dict, Generic[DictType]):
     def __repr__(self) -> str:
         """String representation of the `TensorBatch` object"""
         return self.__str__()
+
+    def _subset_metadata(self, indices: List[int]) -> Optional[Dict[str, Any]]:
+        if self.metadata is None:
+            return None
+        subset: Dict[str, Any] = {}
+        for key, value in self.metadata.items():
+            if isinstance(value, list) and len(value) == self._batch_size:
+                new_list = []
+                for idx in indices:
+                    if idx >= len(value):
+                        continue
+                    item = value[idx]
+                    new_list.append(self._clone_metadata_item(item))
+                subset[key] = new_list
+            else:
+                subset[key] = copy.deepcopy(value)
+        return subset
+
+    @classmethod
+    def _concat_metadata(cls, shards: List["TensorBatch[DictType]"]) -> Optional[Dict[str, Any]]:
+        merged: Optional[Dict[str, Any]] = None
+        for shard in shards:
+            metadata = shard.metadata
+            if metadata is None:
+                continue
+            if merged is None:
+                merged = {}
+            for key, value in metadata.items():
+                if isinstance(value, list):
+                    if key not in merged or not isinstance(merged[key], list):
+                        merged[key] = []
+                    merged[key].extend(cls._clone_metadata_item(item) for item in value)
+                else:
+                    if key not in merged:
+                        merged[key] = copy.deepcopy(value)
+        return merged
+
+    @staticmethod
+    def _clone_metadata_item(item: Any) -> Any:
+        clone_fn = getattr(item, "clone", None)
+        if callable(clone_fn):
+            try:
+                return clone_fn()
+            except TypeError:
+                pass
+        try:
+            return copy.deepcopy(item)
+        except Exception:
+            return item
 
 
 class TrainingInput(TypedDict, total=False):

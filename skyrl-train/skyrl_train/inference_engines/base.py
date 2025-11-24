@@ -1,8 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, TypedDict, Any, Optional, Hashable
+from typing import List, Dict, TypedDict, Any, Optional, Hashable, TYPE_CHECKING
 
 MessageType = Dict[str, str]
 ConversationType = List[MessageType]
+
+if TYPE_CHECKING:
+    from skyrl_train.modalities.batching import ModalityBatch
+    from skyrl_train.modalities.types import SampleModalityData
 
 
 class InferenceEngineInput(TypedDict):
@@ -11,6 +15,8 @@ class InferenceEngineInput(TypedDict):
     prompt_token_ids: Optional[List[List[int]]]
     sampling_params: Optional[Dict[str, Any]]
     session_ids: Optional[List[Hashable]]
+    modalities_batches: Optional[Dict[str, "ModalityBatch"]]
+    modalities_metadata: Optional[List["SampleModalityData"]]
 
 
 class InferenceEngineOutput(TypedDict):
@@ -25,6 +31,7 @@ class InferenceEngineOutput(TypedDict):
     response_ids: List[List[int]]
     stop_reasons: List[str]
     response_logprobs: Optional[List[List[float]]]
+    modalities_metadata: Optional[List["SampleModalityData"]]
 
 
 class NamedWeightsUpdateRequest(TypedDict):

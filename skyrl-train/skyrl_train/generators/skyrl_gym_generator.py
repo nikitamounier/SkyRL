@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from loguru import logger
 
 from skyrl_train.generators.base import GeneratorInterface, GeneratorInput, GeneratorOutput, TrajectoryID
+from skyrl_train.dataset.modalities import normalize_modalities_config, ModalityPlaceholderPlan
+from skyrl_train.modalities.batching import ModalityBatch, build_modality_batches
+from skyrl_train.modalities.types import SampleModalityData
+from skyrl_train.tokenization.multimodal_processor import MultimodalPromptProcessor
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.base import InferenceEngineInput, ConversationType
 from omegaconf import DictConfig
@@ -39,6 +43,7 @@ class AgentLoopOutput:
     prompt_ids: List[int]
     rollout_logprobs: Optional[List[float]]
     env_metrics: Dict[str, Any]
+    modality_metadata: SampleModalityData
 
 
 class SkyRLGymGenerator(GeneratorInterface):
@@ -49,6 +54,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         inference_engine_client: InferenceEngineClient,
         tokenizer,
         model_name: str,
+        modalities_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Args:
@@ -60,6 +66,17 @@ class SkyRLGymGenerator(GeneratorInterface):
         self.skyrl_gym_cfg = skyrl_gym_cfg
         self.inference_engine_client = inference_engine_client
         self.tokenizer = tokenizer
+        self.modalities_config = modalities_config or {}
+        self.modality_specs = normalize_modalities_config(self.modalities_config)
+        self.multimodal_prompt_processor: Optional[MultimodalPromptProcessor] = None
+        if self.modality_specs:
+            chat_kwargs_source = getattr(self.generator_cfg, "chat_template_kwargs", {})
+            chat_template_kwargs = dict(chat_kwargs_source)
+            self.multimodal_prompt_processor = MultimodalPromptProcessor(
+                tokenizer=self.tokenizer,
+                modality_specs=self.modality_specs,
+                chat_template_kwargs=chat_template_kwargs,
+            )
         self.max_turns = generator_cfg.max_turns
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn
@@ -111,6 +128,69 @@ class SkyRLGymGenerator(GeneratorInterface):
             return await loop.run_in_executor(executor, func, *args, **kwargs)
         else:
             return func(*args, **kwargs)
+
+    def _prepare_prompt_tokens(
+        self,
+        messages: ConversationType,
+        env_extra: Dict[str, Any],
+        *,
+        add_generation_prompt: bool,
+        chat_template: Optional[str] = None,
+    ) -> Tuple[List[int], ConversationType]:
+        modalities_entry: Optional[SampleModalityData] = env_extra.get("modalities")
+        plan: Dict[str, ModalityPlaceholderPlan] = {}
+        if modalities_entry is not None:
+            plan = modalities_entry.plans
+
+        if not self.multimodal_prompt_processor or not plan:
+            token_ids = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                chat_template=chat_template,
+                tokenize=True,
+                **self.generator_cfg.chat_template_kwargs,
+            )
+            if modalities_entry is not None:
+                modalities_entry.embedding_spans = {}
+                modalities_entry.expanded_messages = None
+                env_extra["modalities"] = modalities_entry
+            return token_ids, messages
+
+        processed = self.multimodal_prompt_processor.process_prompt(
+            messages,
+            plan,
+            add_generation_prompt=add_generation_prompt,
+            chat_template=chat_template,
+        )
+        if modalities_entry is None:
+            modalities_entry = SampleModalityData()
+        modalities_entry.embedding_spans = processed.embedding_spans
+        modalities_entry.expanded_messages = processed.expanded_messages
+        env_extra["modalities"] = modalities_entry
+        return processed.token_ids, processed.expanded_messages
+
+    def _collect_modalities_metadata(self, env_extra: Dict[str, Any]) -> SampleModalityData:
+        entry: Optional[SampleModalityData] = env_extra.get("modalities")
+        if entry is None:
+            return SampleModalityData()
+        return entry.clone()
+
+    def _build_modalities_batches_for_envs(
+        self, env_extras_list: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, ModalityBatch]]:
+        samples: List[SampleModalityData] = []
+        for env_extra in env_extras_list:
+            if env_extra is None:
+                samples.append(SampleModalityData())
+                continue
+            entry = env_extra.get("modalities")
+            if isinstance(entry, SampleModalityData):
+                samples.append(entry.clone())
+            else:
+                samples.append(SampleModalityData())
+
+        modality_batches = build_modality_batches(samples)
+        return modality_batches if modality_batches else None
 
     async def agent_loop(
         self,
@@ -167,21 +247,31 @@ class SkyRLGymGenerator(GeneratorInterface):
         chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
         initial_chat_history_length = len(chat_history)
         chat_end_index = len(chat_history)
-        input_ids = self.tokenizer.apply_chat_template(
+        input_ids, expanded_chat_history = self._prepare_prompt_tokens(
             chat_history,
-            # If retokenize_chat_history==True, avoid including the generation prompt in both the
-            # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
+            env_extras,
             add_generation_prompt=not retokenize_chat_history,
             chat_template=self.custom_chat_template if retokenize_chat_history else None,
-            tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
         )
+        if expanded_chat_history is not chat_history:
+            chat_history = expanded_chat_history
 
         initial_prompt_length = len(input_ids)
         loss_mask = []  # this excludes the prompt
         rollout_logprobs = None
         # Accumulate per-step rewards. Format: (reward, response_end_token_idx)
         per_step_rewards: List[Tuple[float, Optional[int]]] = []
+
+        single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
+        single_modalities_metadata: Optional[List[SampleModalityData]] = None
+        if single_modalities_batches:
+            single_modalities_metadata = [self._collect_modalities_metadata(env_extras)]
+        if retokenize_chat_history and single_modalities_batches:
+            logger.warning(
+                "Modalities with retokenize_chat_history are not yet fully supported; proceeding without modality batches."
+            )
+            single_modalities_batches = None
+            single_modalities_metadata = None
 
         while not done:
 
@@ -192,17 +282,27 @@ class SkyRLGymGenerator(GeneratorInterface):
             # 1. Generate output
             if retokenize_chat_history:
                 engine_input = InferenceEngineInput(
-                    prompts=[chat_history], session_ids=[session_id], sampling_params=sampling_params
+                    prompts=[chat_history],
+                    session_ids=[session_id],
+                    sampling_params=sampling_params,
                 )
             else:
                 # Token-in-token-out.
                 engine_input = InferenceEngineInput(
-                    prompt_token_ids=[input_ids], session_ids=[session_id], sampling_params=sampling_params
+                    prompt_token_ids=[input_ids],
+                    session_ids=[session_id],
+                    sampling_params=sampling_params,
+                    modalities_batches=single_modalities_batches,
                 )
+                if single_modalities_metadata:
+                    engine_input["modalities_metadata"] = single_modalities_metadata
             engine_output = await self.inference_engine_client.generate(engine_input)
             output = engine_output["responses"][0]
             output_ids = engine_output["response_ids"][0]
             stop_reason = engine_output["stop_reasons"][0]
+            if engine_output.get("modalities_metadata"):
+                single_modalities_metadata = [engine_output["modalities_metadata"][0]]
+                env_extras["modalities"] = single_modalities_metadata[0]
 
             # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
             # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
@@ -319,6 +419,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             prompt_ids=prompt_ids,
             rollout_logprobs=rollout_logprobs,
             env_metrics=env_metrics,
+            modality_metadata=self._collect_modalities_metadata(env_extras),
         )
 
     async def generate_batched(
@@ -344,22 +445,42 @@ class SkyRLGymGenerator(GeneratorInterface):
             GeneratorOutput
         """
         envs = []
-        init_prompts = []
+        batched_env_extras: List[Dict[str, Any]] = []
+        batched_prompt_token_ids: List[List[int]] = []
         for env_class, env_extra, prompt in zip(env_classes, env_extras, prompts):
             env_extra["max_turns"] = self.max_turns
             env_config = self.skyrl_gym_cfg.get(env_class, DictConfig({}))
             env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extra)
             init_prompt, _ = await self._run_in_executor_if_available(env.init, prompt)
-            init_prompts.append(init_prompt)
+            token_ids, _ = self._prepare_prompt_tokens(init_prompt, env_extra, add_generation_prompt=True)
+            batched_prompt_token_ids.append(token_ids)
             envs.append(env)
+            batched_env_extras.append(env_extra)
 
-        # For single-turn generation, we can use text-in-token-out, since we do not need to re-tokenize.
-        engine_input = InferenceEngineInput(prompts=init_prompts, sampling_params=sampling_params)
+        modality_batches = self._build_modalities_batches_for_envs(batched_env_extras)
+        modality_metadata_list: Optional[List[SampleModalityData]] = None
+        if modality_batches:
+            modality_metadata_list = [
+                self._collect_modalities_metadata(env_extra) for env_extra in batched_env_extras
+            ]
+
+        engine_input = InferenceEngineInput(
+            prompt_token_ids=batched_prompt_token_ids,
+            sampling_params=sampling_params,
+            modalities_batches=modality_batches,
+        )
+        if modality_metadata_list:
+            engine_input["modalities_metadata"] = modality_metadata_list
         engine_output = await self.inference_engine_client.generate(engine_input)
         responses = engine_output["responses"]
         all_response_ids = engine_output["response_ids"]
         stop_reasons = engine_output["stop_reasons"]
         logprobs = engine_output.get("response_logprobs", None)
+        returned_metadata = engine_output.get("modalities_metadata")
+        if returned_metadata:
+            modality_metadata_list = returned_metadata
+            for env_extra, metadata in zip(batched_env_extras, modality_metadata_list):
+                env_extra["modalities"] = metadata
 
         truncated_responses = []
         rewards = []
@@ -388,12 +509,14 @@ class SkyRLGymGenerator(GeneratorInterface):
             # Close the environment
             await self._run_in_executor_if_available(env.close)
 
-        prompt_token_ids = self.tokenizer.apply_chat_template(prompts, add_generation_prompt=True, tokenize=True)
+        prompt_token_ids = [ids[:] for ids in batched_prompt_token_ids]
         responses = truncated_responses
         rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes)
 
         if self.generator_cfg.apply_overlong_filtering:
             loss_masks = apply_overlong_filtering(loss_masks, responses, self.tokenizer.eos_token_id)
+
+        modalities_output = modality_metadata_list if modality_metadata_list else None
 
         generator_output: GeneratorOutput = {
             "prompt_token_ids": prompt_token_ids,
@@ -403,6 +526,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "stop_reasons": stop_reasons,
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": truncated_logprobs,
+            "modalities_metadata": modalities_output,
         }
 
         return generator_output
@@ -480,6 +604,14 @@ class SkyRLGymGenerator(GeneratorInterface):
         if self.generator_cfg.apply_overlong_filtering:
             loss_masks = apply_overlong_filtering(loss_masks, responses, self.tokenizer.eos_token_id)
 
+        modalities_metadata_output = [output.modality_metadata for output in all_outputs]
+        if not any(
+            meta.plans or meta.encoder_outputs or meta.projected_embeddings for meta in modalities_metadata_output
+        ):
+            modalities_metadata_output_field = None
+        else:
+            modalities_metadata_output_field = modalities_metadata_output
+
         generator_output: GeneratorOutput = {
             "prompt_token_ids": prompt_token_ids,
             "response_ids": responses,
@@ -488,6 +620,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "stop_reasons": stop_reasons,
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": rollout_logprobs,
+            "modalities_metadata": modalities_metadata_output_field,
         }
 
         return generator_output

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -37,7 +38,7 @@ from skyrl_train.dataset.replay_buffer import Experience
 from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.utils.utils import configure_ray_worker_logging
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
 _SET_AFFINITY = False
@@ -221,6 +222,16 @@ class Worker(DistributedTorchRayActor):
             "free": free,
             "total": total,
         }
+
+    def _get_modalities_capable_module(self) -> Optional[nn.Module]:
+        model = getattr(self, "model", None)
+        visited = set()
+        while model is not None and model not in visited:
+            if hasattr(model, "prepare_inputs_embeds"):
+                return model
+            visited.add(model)
+            model = getattr(model, "module", None)
+        return None
 
     def save_memory_snapshot(self, global_step=None, local_step=None):
         """Save a snapshot of memory usage on the Worker's CUDA device.
@@ -731,10 +742,18 @@ class PolicyWorkerBase(Worker):
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
         rollout_action_logprobs = experience.rollout_logprobs
+        modalities_metadata = None
+        if experience.metadata is not None:
+            modalities_metadata = experience.metadata.get("modalities_metadata")
+        supports_modalities = self._get_modalities_capable_module() is not None
+        supports_modalities = self._get_modalities_capable_module() is not None
 
         # TODO (sumanthrh): don't think this does anything for deepspeed or fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
+            model_kwargs = {}
+            if supports_modalities and modalities_metadata is not None:
+                model_kwargs["modalities_metadata"] = modalities_metadata
             action_log_probs, output = self.model(
                 sequences,
                 num_actions,
@@ -742,6 +761,7 @@ class PolicyWorkerBase(Worker):
                 temperature=self.cfg.generator.sampling_params.temperature,
                 return_output=True,
                 compute_entropy=True,
+                **model_kwargs,
             )
             # loss function
             # TODO: recompute advantages
@@ -839,6 +859,20 @@ class PolicyWorkerBase(Worker):
             export_dir,
             tokenizer=tokenizer,
         )
+        modalities_cfg = None
+        try:
+            modalities_cfg = self.cfg.get("modalities", None)
+        except AttributeError:
+            modalities_cfg = None
+        if modalities_cfg:
+            try:
+                modalities_snapshot = OmegaConf.to_container(modalities_cfg, resolve=True)
+                if modalities_snapshot:
+                    modalities_path = os.path.join(export_dir, "modalities_config.json")
+                    with io.open_file(modalities_path, "w") as f:
+                        json.dump(modalities_snapshot, f, indent=2)
+            except Exception as exc:
+                logger.warning(f"Failed to save modalities config with HF export: {exc}")
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
@@ -847,6 +881,18 @@ class PolicyWorkerBase(Worker):
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        metadata = micro_batch.metadata or {}
+        modalities_metadata = metadata.get("modalities_metadata")
+        supports_modalities = self._get_modalities_capable_module() is not None
+
+        if modalities_metadata is not None and len(modalities_metadata) != sequences.size(0):
+            raise ValueError(
+                f"Modalities metadata length {len(modalities_metadata)} does not match batch size {sequences.size(0)}."
+            )
+
+        model_kwargs = {}
+        if supports_modalities and modalities_metadata is not None:
+            model_kwargs["modalities_metadata"] = modalities_metadata
 
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             policy_logprob = self.model(
@@ -855,6 +901,7 @@ class PolicyWorkerBase(Worker):
                 attention_mask,
                 return_output=False,
                 temperature=self.cfg.generator.sampling_params.temperature,
+                **model_kwargs,
             )
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(
@@ -901,12 +948,24 @@ class CriticWorkerBase(Worker):
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        metadata = micro_batch.metadata or {}
+        modalities_metadata = metadata.get("modalities_metadata")
+        supports_modalities = self._get_modalities_capable_module() is not None
+
+        if modalities_metadata is not None and len(modalities_metadata) != sequences.size(0):
+            raise ValueError(
+                f"Modalities metadata length {len(modalities_metadata)} does not match batch size {sequences.size(0)}."
+            )
         self.model.eval()
+        model_kwargs = {}
+        if supports_modalities and modalities_metadata is not None:
+            model_kwargs["modalities_metadata"] = modalities_metadata
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             value = self.model(
                 sequences,
                 response_length,
                 attention_mask,
+                **model_kwargs,
             )
         self.model.train()  # reset model state
         value = value.to("cpu")
@@ -985,11 +1044,18 @@ class CriticWorkerBase(Worker):
 
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # critic loss
+            modalities_metadata = None
+            if experience.metadata is not None:
+                modalities_metadata = experience.metadata.get("modalities_metadata")
+            model_kwargs = {}
+            if supports_modalities and modalities_metadata is not None:
+                model_kwargs["modalities_metadata"] = modalities_metadata
             values, output = self.model(
                 sequences,
                 num_actions=num_actions,
                 attention_mask=attention_mask,
                 return_output=True,
+                **model_kwargs,
             )
             # loss function
             loss, clipfrac = self.critic_loss_fn(
@@ -1051,8 +1117,24 @@ class RefWorkerBase(Worker):
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        metadata = micro_batch.metadata or {}
+        modalities_metadata = metadata.get("modalities_metadata")
+        supports_modalities = self._get_modalities_capable_module() is not None
+        if modalities_metadata is not None and len(modalities_metadata) != sequences.size(0):
+            raise ValueError(
+                f"Modalities metadata length {len(modalities_metadata)} does not match batch size {sequences.size(0)}."
+            )
+        model_kwargs = {}
+        if supports_modalities and modalities_metadata is not None:
+            model_kwargs["modalities_metadata"] = modalities_metadata
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            log_probs = self.model(sequences, response_length, attention_mask, return_output=False)
+            log_probs = self.model(
+                sequences,
+                response_length,
+                attention_mask,
+                return_output=False,
+                **model_kwargs,
+            )
         log_probs = log_probs.to("cpu")
         output = TrainingOutputBatch(
             {"output": log_probs},

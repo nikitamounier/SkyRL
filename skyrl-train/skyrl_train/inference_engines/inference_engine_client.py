@@ -14,6 +14,8 @@ from skyrl_train.inference_engines.utils import (
     postprocess_completion_request,
     aggregate_completion_usage_info,
 )
+from skyrl_train.modalities.batching import subset_modality_batches, subset_modalities_metadata
+from skyrl_train.modalities import SampleModalityData
 from omegaconf import DictConfig
 import threading
 from loguru import logger
@@ -43,6 +45,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         self.enable_http_endpoint = full_config.generator.enable_http_endpoint
         self.http_endpoint_host = full_config.generator.http_endpoint_host
         self.http_endpoint_port = full_config.generator.http_endpoint_port
+        self.modalities_config = full_config.modalities
         if self.enable_http_endpoint:
             self._spin_up_http_endpoint()
 
@@ -63,10 +66,14 @@ class InferenceEngineClient(InferenceEngineInterface):
         prompt_token_ids = input_batch.get("prompt_token_ids")
         session_ids = input_batch.get("session_ids")
         sampling_params = input_batch.get("sampling_params")
+        modalities_batches = input_batch.get("modalities_batches")
+        modalities_metadata = input_batch.get("modalities_metadata")
 
         if (prompts is None and prompt_token_ids is None) or (prompts is not None and prompt_token_ids is not None):
             raise ValueError("Either `prompts` or `prompt_token_ids` must be provided, but not both.")
         if prompt_token_ids is None:
+            if modalities_batches:
+                raise ValueError("`prompt_token_ids` must be provided when modalities are present.")
             prompt_token_ids = self.tokenizer.apply_chat_template(
                 prompts,
                 add_generation_prompt=True,
@@ -91,10 +98,19 @@ class InferenceEngineClient(InferenceEngineInterface):
         for engine_idx, prompt_ids in engine_idx_to_prompt_ids.items():
             # index prompt_token_ids with prompt_ids
             cur_prompt_token_ids = [prompt_token_ids[i] for i in prompt_ids]
-            engine_input = InferenceEngineInput(
-                prompt_token_ids=cur_prompt_token_ids,
-                sampling_params=sampling_params,
-            )
+            engine_input_dict = {
+                "prompt_token_ids": cur_prompt_token_ids,
+                "sampling_params": sampling_params,
+            }
+            if modalities_batches:
+                sub_batches = subset_modality_batches(modalities_batches, prompt_ids)
+                if sub_batches:
+                    engine_input_dict["modalities_batches"] = sub_batches
+            if modalities_metadata:
+                sub_metadata = subset_modalities_metadata(modalities_metadata, prompt_ids)
+                if sub_metadata:
+                    engine_input_dict["modalities_metadata"] = sub_metadata
+            engine_input = InferenceEngineInput(**engine_input_dict)
             tasks.append(asyncio.create_task(self.engines[engine_idx].generate(engine_input)))
             indices_list.append(prompt_ids)
 
@@ -106,6 +122,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         stop_reasons: list[str] = [""] * n
         response_logprobs: List[Optional[List[float]]] = [None for _ in range(n)]
         response_ids: List[List[int]] = [[] for _ in range(n)]
+        modalities_metadata_out: List[Optional[SampleModalityData]] = [None for _ in range(n)]
         # a bit hacky for now
         add_resp_logprobs = False
 
@@ -117,12 +134,27 @@ class InferenceEngineClient(InferenceEngineInterface):
                 if result.get("response_logprobs", None):
                     add_resp_logprobs = True
                     response_logprobs[original_idx] = result["response_logprobs"][local_idx]
+                if result.get("modalities_metadata", None):
+                    meta = result["modalities_metadata"][local_idx]
+                    modalities_metadata_out[original_idx] = meta
+
+        if any(meta is not None for meta in modalities_metadata_out):
+            modalities_metadata_final = [
+                meta if meta is not None else SampleModalityData() for meta in modalities_metadata_out
+            ]
+            if not any(
+                meta.plans or meta.encoder_outputs or meta.projected_embeddings for meta in modalities_metadata_final
+            ):
+                modalities_metadata_final = None
+        else:
+            modalities_metadata_final = None
 
         return InferenceEngineOutput(
             responses=responses,
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs if add_resp_logprobs else None,
+            modalities_metadata=modalities_metadata_final,
         )
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -1,8 +1,11 @@
 import torch
 from typing import List, Tuple, Union, Optional, Dict, Any
+import copy
 from collections import defaultdict
 import numpy as np
 from skyrl_train.generators.base import GeneratorOutput, GeneratorInput, TrajectoryID, BatchMetadata, TrainingPhase
+from skyrl_train.modalities.batching import build_modality_batches
+from skyrl_train.modalities.types import SampleModalityData
 from skyrl_train.inference_engines.base import ConversationType
 from omegaconf import DictConfig
 from loguru import logger
@@ -167,12 +170,28 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput]) -> G
 
     # propagate additional keys with list values as-is
     additional_keys = [
-        key for key in generator_outputs[0] if key not in result and isinstance(generator_outputs[0][key], list)
+        key
+        for key in generator_outputs[0]
+        if key not in result and isinstance(generator_outputs[0][key], list) and key != "modalities_metadata"
     ]
     if len(additional_keys):
         logger.info(f"Attempting to concatenate values for additional keys {additional_keys}")
     for key in additional_keys:
         result[key] = sum([generator_output[key] for generator_output in generator_outputs], [])
+
+    has_modalities = any(output.get("modalities_metadata") for output in generator_outputs)
+    if has_modalities:
+        aggregated: List[SampleModalityData] = []
+        for output in generator_outputs:
+            metadata_list = output.get("modalities_metadata")
+            if metadata_list is None:
+                raise ValueError("Expected modalities_metadata for all generator outputs when present in any output")
+            for metadata in metadata_list:
+                if hasattr(metadata, "clone"):
+                    aggregated.append(metadata.clone())
+                else:
+                    aggregated.append(copy.deepcopy(metadata))
+        result["modalities_metadata"] = aggregated
 
     return result
 
@@ -285,7 +304,14 @@ def prepare_generator_input(
     ]
 
     # all the other columns are env_extras
-    env_extras = [prompt["env_extras"] for prompt in prompts for _ in range(n_samples_per_prompt)]
+    env_extras = [copy.deepcopy(prompt["env_extras"]) for prompt in prompts for _ in range(n_samples_per_prompt)]
+    modality_samples: List[SampleModalityData] = []
+    for extras in env_extras:
+        modality_entry = extras.get("modalities") if extras else None
+        if isinstance(modality_entry, SampleModalityData):
+            modality_samples.append(modality_entry)
+        else:
+            modality_samples.append(SampleModalityData())
 
     # Create TrajectoryID objects - one UID per row, repetition_id for multiple samples
     trajectory_ids = []
@@ -305,7 +331,13 @@ def prepare_generator_input(
         "sampling_params": sampling_params,
         "trajectory_ids": trajectory_ids,
         "batch_metadata": BatchMetadata(global_step=global_step, training_phase=training_phase),
+        "modalities_batches": None,
     }
+
+    modality_batches = build_modality_batches(modality_samples)
+    if modality_batches:
+        generator_input["modalities_batches"] = modality_batches
+        generator_input["modalities_metadata"] = [sample.clone() for sample in modality_samples]
 
     return generator_input, uids
 

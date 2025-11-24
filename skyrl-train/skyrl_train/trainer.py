@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import math
 import os
 import shutil
@@ -9,7 +10,7 @@ import ray
 from ray import ObjectRef
 import torch
 from loguru import logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from ray.util.placement_group import PlacementGroup, placement_group
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -56,6 +57,7 @@ from skyrl_train.utils.trainer_utils import (
 )
 from skyrl_train.utils.utils import configure_ray_worker_logging
 from skyrl_train.evaluate import evaluate
+from skyrl_train.modalities.types import SampleModalityData
 
 
 class RayPPOTrainer:
@@ -71,6 +73,7 @@ class RayPPOTrainer:
         eval_dataset: Optional[PromptDataset] = None,
     ):
         self.cfg = cfg
+        self.modalities_config = cfg.trainer.modalities
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -546,6 +549,17 @@ class RayPPOTrainer:
         training_input.metadata["avg_response_length"] = sum(
             len(sample_response_ids) for sample_response_ids in response_ids
         ) / len(response_ids)
+        modalities_metadata = generator_output.get("modalities_metadata")
+        if modalities_metadata is not None:
+            cloned_modalities = []
+            for metadata in modalities_metadata:
+                if isinstance(metadata, SampleModalityData):
+                    cloned_modalities.append(metadata.clone())
+                elif hasattr(metadata, "clone"):
+                    cloned_modalities.append(metadata.clone())
+                else:
+                    cloned_modalities.append(copy.deepcopy(metadata))
+            training_input.metadata["modalities_metadata"] = cloned_modalities
         return training_input
 
     @torch.no_grad()
@@ -702,7 +716,10 @@ class RayPPOTrainer:
             - `["action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `["values"]`: Float[torch.Tensor, "batch_size"]
         """
-        data_fwd_pass = training_input.select(keys=["sequences", "attention_mask"], metadata_keys=["response_length"])
+        metadata_keys = ["response_length"]
+        if "modalities_metadata" in (training_input.metadata or {}):
+            metadata_keys.append("modalities_metadata")
+        data_fwd_pass = training_input.select(keys=["sequences", "attention_mask"], metadata_keys=metadata_keys)
 
         def collect_results(actor_infos, results, key):
             ret_outputs: TrainingOutputBatch = concatenate_outputs_after_mesh_dispatch(actor_infos, results)
@@ -1033,9 +1050,19 @@ class RayPPOTrainer:
             logger.warning(f"Failed to save dataloader state: {e}")
 
         # Save additional trainer state
+        modalities_snapshot = {}
+        try:
+            cfg_modalities = self.cfg.get("modalities", None)
+            modalities_snapshot = (
+                OmegaConf.to_container(cfg_modalities, resolve=True) if cfg_modalities is not None else {}
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to serialize modalities config for checkpoint: {exc}")
+
         trainer_state = {
             "global_step": self.global_step,
             "config": self.cfg,
+            "modalities_config": modalities_snapshot,
         }
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
         with io.open_file(trainer_state_path, "wb") as f:
@@ -1137,6 +1164,22 @@ class RayPPOTrainer:
         if saved_global_step != global_step:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")
 
+        saved_modalities = trainer_state.get("modalities_config", {}) or {}
+        try:
+            cfg_modalities = self.cfg.get("modalities", None)
+            current_modalities = (
+                OmegaConf.to_container(cfg_modalities, resolve=True) if cfg_modalities is not None else {}
+            )
+        except Exception as exc:
+            logger.error(f"Failed to materialize current modalities config: {exc}")
+            current_modalities = {}
+
+        if current_modalities != saved_modalities:
+            raise ValueError(
+                "Modalities configuration in checkpoint does not match the active config. "
+                "Please ensure the training run is resumed with the same `modalities` block."
+            )
+
         # 2. Load dataloader state if available
         if io.exists(dataloader_state_path):
             try:
@@ -1177,6 +1220,9 @@ class RayPPOTrainer:
                 )
             )
             logger.info("Successfully loaded critic checkpoint")
+
+        # Ensure inference engines receive the restored projection weights.
+        ray.get(self.sync_policy_weights_to_inference_engines())
 
         logger.info(f"Successfully loaded complete checkpoint state from global_step_{global_step}")
         return global_step

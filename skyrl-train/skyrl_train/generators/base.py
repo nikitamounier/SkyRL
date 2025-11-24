@@ -1,7 +1,11 @@
-from typing import List, Dict, Any, TypedDict, Optional, Union, Literal
+from typing import List, Dict, Any, TypedDict, Optional, Union, Literal, TYPE_CHECKING
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from skyrl_train.inference_engines.base import ConversationType
+
+if TYPE_CHECKING:
+    from skyrl_train.modalities.types import ModalitiesMetadata
+    from skyrl_train.modalities.batching import ModalityBatch
 
 TrainingPhase = Literal["train", "eval"]
 
@@ -25,6 +29,8 @@ class GeneratorInput(TypedDict):
     sampling_params: Optional[Dict[str, Any]]
     trajectory_ids: Optional[List[TrajectoryID]]
     batch_metadata: Optional[BatchMetadata]
+    modalities_batches: Optional[Dict[str, "ModalityBatch"]]
+    modalities_metadata: Optional[List["ModalitiesMetadata"]]
 
 
 class GeneratorOutput(TypedDict):
@@ -35,6 +41,7 @@ class GeneratorOutput(TypedDict):
     stop_reasons: Optional[List[str]]
     rollout_metrics: Optional[Dict[str, Any]]
     rollout_logprobs: Optional[List[List[float]]]
+    modalities_metadata: Optional[List["ModalitiesMetadata"]]
 
 
 class GeneratorInterface(ABC):

@@ -389,7 +389,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             cache_reset_task = inference_engine_client.reset_prefix_cache()
 
         torch.cuda.empty_cache()
-        per_tensor_param = self.bridge.export_weights(self.actor_module)
+        per_tensor_param = list(self.bridge.export_weights(self.actor_module))
+        # Append modality-specific parameters if present
+        if self.actor_module and hasattr(self.actor_module[0], "modalities_manager"):
+            manager = getattr(self.actor_module[0], "modalities_manager", None)
+            if manager is not None:
+                for modality_id, role, module in manager.iter_handler_modules():
+                    if not isinstance(module, torch.nn.Module):
+                        continue
+                    for sub_name, sub_param in module.named_parameters():
+                        full_name = f"modalities.{modality_id}.{role}.{sub_name}"
+                        per_tensor_param.append((full_name, sub_param))
         weights_update_request = {"names": [], "dtypes": [], "shapes": [], "extras": []}
         current_size = 0
 

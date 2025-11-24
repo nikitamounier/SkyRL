@@ -1,5 +1,5 @@
 import os
-from typing import List, Any, Dict, Optional
+from typing import List, Any, Dict, Optional, Sequence, Tuple
 from dataclasses import dataclass
 from http import HTTPStatus
 import ray
@@ -8,7 +8,7 @@ import asyncio
 import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
-from vllm.inputs import TokensPrompt
+from vllm.inputs import TokensPrompt, EmbedsPrompt
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
@@ -35,6 +35,12 @@ from skyrl_train.inference_engines.vllm.utils import pop_openai_kwargs
 from loguru import logger
 from skyrl_train.utils import str_to_torch_dtype
 import time
+from skyrl_train.modalities import (
+    ModalitiesManager,
+    PromptEmbeddingBuilder,
+    ModalityBatch,
+    SampleModalityData,
+)
 
 
 @dataclass
@@ -114,22 +120,35 @@ class WorkerWrap:
 
     def update_weights(self, names: List[str], dtypes: List[str], shapes: List[List[int]]):
         """Broadcast weight to all vllm workers from source rank 0 (actor model)"""
+        modality_weights = []
         weight_list = []
         for name, dtype, shape in zip(names, dtypes, shapes):
             dtype = str_to_torch_dtype(dtype)
             assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
             weight = torch.empty(shape, dtype=dtype, device="cuda")
             torch.distributed.broadcast(weight, 0, group=self._model_update_group)
-            weight_list.append((name, weight))
+            if name.startswith("modalities."):
+                modality_weights.append((name, weight))
+            else:
+                weight_list.append((name, weight))
 
-        self.model_runner.model.load_weights(weights=weight_list)
-        for weight in weight_list:
-            del weight
+        if weight_list:
+            self.model_runner.model.load_weights(weights=weight_list)
+            for weight in weight_list:
+                del weight
+
+        if modality_weights and getattr(self, "modalities_manager", None):
+            for name, tensor in modality_weights:
+                updated = self.modalities_manager.set_named_parameter(name, tensor)
+                if not updated:
+                    logger.warning("Failed to apply modality weight `%s` on vLLM worker", name)
+                del tensor
 
     def update_weights_cuda_ipc(
         self, names: List[str], dtypes: List[str], shapes: List[int], ipc_handles: List[Dict[str, Any]]
     ):
 
+        modality_weights = []
         weight_list = []
         for name, dtype, shape, ipc_handle in zip(names, dtypes, shapes, ipc_handles):
 
@@ -149,12 +168,23 @@ class WorkerWrap:
             # in case two processes have different CUDA_VISIBLE_DEVICES
             list_args[6] = device_id
             weight = func(*list_args)
-            weight_list.append((name, weight))
+            if name.startswith("modalities."):
+                modality_weights.append((name, weight))
+            else:
+                weight_list.append((name, weight))
 
-        self.model_runner.model.load_weights(weights=weight_list)
+        if weight_list:
+            self.model_runner.model.load_weights(weights=weight_list)
 
-        for weight in weight_list:
-            del weight
+            for weight in weight_list:
+                del weight
+
+        if modality_weights and getattr(self, "modalities_manager", None):
+            for name, tensor in modality_weights:
+                updated = self.modalities_manager.set_named_parameter(name, tensor)
+                if not updated:
+                    logger.warning("Failed to apply modality weight `%s` on vLLM worker", name)
+                del tensor
 
     # TODO (sumanthrh): Add destroy process group RPC as a atexit handler to Trainer code.
     def destroy_weights_update_group(self):
@@ -168,6 +198,8 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     """Base class containing shared logic between sync and async VLLM engines."""
 
     def __init__(self, *args, bundle_indices: list = None, **kwargs):
+        self._model_path = kwargs.get("model")
+        modalities_config = kwargs.pop("modalities_config", None)
         setup_envvars_for_vllm(kwargs, bundle_indices)
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
         if vllm_v1_disable_multiproc or vllm.__version__ == "0.8.2":
@@ -182,6 +214,27 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
 
         # Let subclass create the appropriate engine
         self.llm = self._create_engine(*args, **kwargs)
+        engine = self._get_engine()
+        model_config = engine.model_config
+
+        hidden_size = getattr(model_config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError("Unable to determine model hidden size for prompt embedding builder.")
+
+        dtype_str = str(getattr(model_config, "dtype", "float32"))
+        target_dtype = str_to_torch_dtype(dtype_str)
+        target_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+
+        self.modalities_manager = ModalitiesManager(modalities_config)
+        self.prompt_embedding_builder = PromptEmbeddingBuilder(
+            embedding_dim=hidden_size,
+            target_device=target_device,
+            target_dtype=target_dtype,
+        )
+        self.prompt_embedding_builder.ensure_initialized(self._model_path)
+        if not self.prompt_embedding_builder.has_base_embedding():
+            self._refresh_prompt_embedding_from_engine()
+        self._prefix_cache_enabled = kwargs.get("enable_prefix_caching", False)
 
     def tp_size(self):
         return self._tp_size
@@ -201,6 +254,8 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         prompts = input_batch.get("prompts")
         prompt_token_ids = input_batch.get("prompt_token_ids")
         request_sampling_params = input_batch.get("sampling_params")
+        modality_batches = input_batch.get("modalities_batches")
+        modality_metadata = input_batch.get("modalities_metadata")
 
         assert (
             prompts is None and prompt_token_ids is not None
@@ -210,7 +265,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             SamplingParams(**request_sampling_params) if request_sampling_params is not None else SamplingParams()
         )
 
-        return prompt_token_ids, sampling_params
+        return prompt_token_ids, sampling_params, modality_batches, modality_metadata
 
     def _postprocess_outputs(self, outputs):
         """Common output processing logic."""
@@ -247,7 +302,100 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs,
+            modalities_metadata=None,
         )
+
+    def _refresh_prompt_embedding_from_engine(self) -> None:
+        if not getattr(self, "prompt_embedding_builder", None):
+            return
+        builder = self.prompt_embedding_builder
+        try:
+            engine = self._get_engine()
+            model_executor = getattr(engine, "model_executor", None)
+            if model_executor is None:
+                return
+            driver_worker = getattr(model_executor, "driver_worker", None)
+            if driver_worker is None:
+                return
+            model_runner = getattr(driver_worker, "model_runner", None)
+            if model_runner is None:
+                return
+            model = getattr(model_runner, "model", None)
+            if model is None or not hasattr(model, "get_input_embeddings"):
+                return
+            embedding_module = model.get_input_embeddings()
+            if embedding_module is None or not hasattr(embedding_module, "weight"):
+                return
+            weight = embedding_module.weight.detach().cpu()
+            builder.set_base_embedding(weight)
+            logger.debug("Prompt embedding table refreshed from vLLM model weights.")
+        except Exception:
+            logger.exception("Failed to refresh prompt embedding table from vLLM engine.")
+
+    async def _maybe_refresh_prompt_embeddings(self, names: Sequence[str]) -> None:
+        builder = getattr(self, "prompt_embedding_builder", None)
+        if not builder or not names:
+            return
+        expected_names = set(builder.embedding_weight_names)
+        if not any(name in expected_names for name in names):
+            return
+        await asyncio.to_thread(self._refresh_prompt_embedding_from_engine)
+
+    def _prepare_prompt_inputs(
+        self,
+        prompt_token_ids: List[List[int]],
+        modality_batches: Optional[Dict[str, ModalityBatch]],
+        modality_metadata: Optional[List[SampleModalityData]],
+    ) -> Tuple[List[Dict[str, Any]], Optional[List[SampleModalityData]]]:
+        num_prompts = len(prompt_token_ids)
+        metadata_list = list(modality_metadata) if modality_metadata else []
+        created_metadata = False
+        if metadata_list and len(metadata_list) != num_prompts:
+            raise ValueError(
+                f"Expected {num_prompts} modality metadata entries, got {len(metadata_list)}."
+            )
+        if not metadata_list:
+            metadata_list = [SampleModalityData() for _ in range(num_prompts)]
+            created_metadata = True
+
+        replacements: Dict[int, List[Tuple[Tuple[int, int], torch.Tensor]]] = {}
+        if modality_batches and self.modalities_manager and self.modalities_manager.has_modalities():
+            replacements = self.modalities_manager.compute_embeddings(
+                modality_batches,
+                metadata_list,
+                target_device=self.prompt_embedding_builder.device,
+                target_dtype=self.prompt_embedding_builder.dtype,
+            )
+
+        prompts: List[Dict[str, Any]]
+        if replacements:
+            if not self.prompt_embedding_builder.has_base_embedding():
+                self._refresh_prompt_embedding_from_engine()
+            if not self.prompt_embedding_builder.has_base_embedding():
+                raise RuntimeError(
+                    "Prompt embedding builder does not have base embeddings available after refresh."
+                )
+            if self._prefix_cache_enabled:
+                logger.warning("Prompt embeddings detected; disabling prefix cache for compatibility.")
+                self._prefix_cache_enabled = False
+                try:
+                    self.reset_prefix_cache()
+                except Exception:
+                    logger.exception("Failed to reset prefix cache after disabling it.")
+            prompt_embeds = self.prompt_embedding_builder.build_prompt_embeddings_for_batch(
+                prompt_token_ids,
+                replacements,
+            )
+            prompts = [EmbedsPrompt(prompt_embeds=embed) for embed in prompt_embeds]
+            metadata_out: Optional[List[SampleModalityData]] = metadata_list
+        else:
+            prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
+            metadata_out = None if created_metadata else metadata_list if any(
+                md.plans or md.encoder_outputs or md.projected_embeddings for md in metadata_list
+            ) else None
+        if metadata_out is not None:
+            metadata_out = [meta.clone() for meta in metadata_out]
+        return prompts, metadata_out
 
     def _get_engine(self):
         """Get the underlying engine for RPC calls."""
@@ -280,7 +428,17 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         return vllm.LLM(*args, **kwargs)
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
-        prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        (
+            prompt_token_ids,
+            sampling_params,
+            modality_batches,
+            modality_metadata,
+        ) = self._preprocess_prompts(input_batch)
+        prompt_requests, updated_metadata = self._prepare_prompt_inputs(
+            prompt_token_ids,
+            modality_batches,
+            modality_metadata,
+        )
 
         # Check if LoRA is enabled and create LoRA requests
         lora_requests = None
@@ -288,7 +446,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
             lora_int_ids = list(self.llm.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
-                batch_size = len(prompt_token_ids)
+                batch_size = len(prompt_requests)
                 # dummy_lora_path for placeholder (actual loading done in add_lora())
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/dummy_lora_path")
@@ -296,12 +454,15 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         outputs = await asyncio.to_thread(
             self.llm.generate,
-            prompts=[TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids],
+            prompts=prompt_requests,
             sampling_params=sampling_params,
             lora_request=lora_requests,
         )
 
-        return self._postprocess_outputs(outputs)
+        result = self._postprocess_outputs(outputs)
+        if updated_metadata is not None:
+            result["modalities_metadata"] = updated_metadata
+        return result
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Only supported in AsyncVLLMInferenceEngine."""
@@ -361,7 +522,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         # Use IPC if handles are provided
         if request.get("extras") and "ipc_handles" in request["extras"][0]:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 engine.collective_rpc,
                 "update_weights_cuda_ipc",
                 args=(
@@ -371,13 +532,17 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                     [extra["ipc_handles"] for extra in request["extras"]],
                 ),
             )
+            await self._maybe_refresh_prompt_embeddings(request["names"])
+            return result
         else:
             assert (
                 len(request["names"]) == 1
             ), f"Update weights without cuda IPC only supports a single named weight at a time , got request with {len(request['names'])} entries"
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 engine.collective_rpc, "update_weights", args=(request["names"], request["dtypes"], request["shapes"])
             )
+            await self._maybe_refresh_prompt_embeddings(request["names"])
+            return result
 
     async def teardown(self):
         await self._destroy_weights_update_group()
@@ -437,7 +602,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         result = await self.llm.add_lora(lora_request)
         return result
 
-    async def _collect_outputs(self, prompt_token_ids, request_id: str, sampling_params: SamplingParams):
+    async def _collect_outputs(self, prompt_request: Dict[str, Any], request_id: str, sampling_params: SamplingParams):
         """Collect outputs for a single prompt."""
         # Check if LoRA is enabled and create LoRA request
         final_output = None
@@ -453,7 +618,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 )
 
         async for request_output in self.llm.generate(
-            prompt=TokensPrompt(prompt_token_ids=prompt_token_ids),
+            prompt=prompt_request,
             sampling_params=sampling_params,
             request_id=request_id,
             lora_request=lora_request,
@@ -464,10 +629,20 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         """Generate responses using vLLM's async engine."""
-        prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        (
+            prompt_token_ids,
+            sampling_params,
+            modality_batches,
+            modality_metadata,
+        ) = self._preprocess_prompts(input_batch)
+        prompt_requests, updated_metadata = self._prepare_prompt_inputs(
+            prompt_token_ids,
+            modality_batches,
+            modality_metadata,
+        )
 
         tasks = []
-        for prompt in prompt_token_ids:
+        for prompt in prompt_requests:
             # Schedule the collection of outputs for each prompt.
             # Avoid duplicate request_ids
             request_id = str(uuid4().hex)
@@ -475,7 +650,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             tasks.append(task)
         outputs = await asyncio.gather(*tasks)
 
-        return self._postprocess_outputs(outputs)
+        result = self._postprocess_outputs(outputs)
+        if updated_metadata is not None:
+            result["modalities_metadata"] = updated_metadata
+        return result
 
     async def wake_up(self, *args: Any, **kwargs: Any):
         await self.llm.wake_up(tags=kwargs.get("tags", None))

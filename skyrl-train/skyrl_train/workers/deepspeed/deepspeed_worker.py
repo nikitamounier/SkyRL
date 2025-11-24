@@ -63,6 +63,7 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
             sequence_parallel_size=self.sequence_parallel_size,
             use_sample_packing=self.cfg.trainer.use_sample_packing,
             use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
+            modalities_config=self.cfg.trainer.modalities,
         )
 
         # configure optimizer
@@ -124,7 +125,18 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
             cache_reset_task = inference_engine_client.reset_prefix_cache()
 
         torch.cuda.empty_cache()
-        model = self.model.model.module
+        wrapped_model = self.model.module if hasattr(self.model, "module") else self.model
+        modality_params = []
+        modalities_manager = getattr(wrapped_model, "modalities_manager", None)
+        if modalities_manager is not None:
+            for modality_id, role, module in modalities_manager.iter_handler_modules():
+                if not isinstance(module, torch.nn.Module):
+                    continue
+                for sub_name, sub_param in module.named_parameters():
+                    full_name = f"modalities.{modality_id}.{role}.{sub_name}"
+                    modality_params.append((full_name, sub_param))
+
+        model = wrapped_model.model.module
         if not self.use_cuda_ipc:
             for name, param in model.named_parameters():
                 if torch.distributed.get_rank() == 0:
@@ -151,6 +163,39 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
                 await asyncio.to_thread(gather_and_broadcast, param)
                 if torch.distributed.get_rank() == 0:
                     await update_weight_task
+            torch.distributed.barrier()
+
+            for name, param in modality_params:
+                tensor_holder = None
+
+                def gather_and_broadcast(p):
+                    nonlocal tensor_holder
+                    with deepspeed.zero.GatheredParameters([p], enabled=self.zero_stage == 3):
+                        if torch.distributed.get_rank() == 0:
+                            tensor_holder = p.data.detach().clone().to(generator_dtype)
+                        else:
+                            tensor_holder = torch.empty(
+                                list(p.shape), dtype=generator_dtype, device=p.device
+                            )
+                    torch.distributed.broadcast(tensor_holder, 0, group=self._model_update_group)
+
+                if torch.distributed.get_rank() == 0:
+                    update_weight_task = asyncio.create_task(
+                        inference_engine_client.update_named_weights(
+                            {
+                                "names": [name],
+                                "dtypes": [self.cfg.generator.model_dtype],
+                                "shapes": [list(param.shape)],
+                            }
+                        )
+                    )
+                else:
+                    update_weight_task = None
+
+                await asyncio.to_thread(gather_and_broadcast, param)
+                if update_weight_task is not None:
+                    await update_weight_task
+                del tensor_holder
             torch.distributed.barrier()
         # CUDA IPC
         else:
@@ -224,6 +269,21 @@ class DeepSpeedPolicyWorkerBase(PolicyWorkerBase):
                 torch.cuda.ipc_collect()
             torch.distributed.barrier()
 
+            if torch.distributed.get_rank() == 0 and modality_params:
+                weights_update_request = {"names": [], "dtypes": [], "shapes": [], "extras": []}
+                for name, param in modality_params:
+                    tensor = param.data.to(generator_dtype)
+                    ipc_handle = reduce_tensor(tensor)
+                    ipc_map = {get_physical_gpu_id(): ipc_handle}
+                    weights_update_request["names"].append(name)
+                    weights_update_request["dtypes"].append(self.cfg.generator.model_dtype)
+                    weights_update_request["shapes"].append(list(param.shape))
+                    weights_update_request["extras"].append({"ipc_handles": ipc_map})
+                if weights_update_request["names"]:
+                    await asyncio.create_task(inference_engine_client.update_named_weights(weights_update_request))
+                    torch.cuda.ipc_collect()
+            torch.distributed.barrier()
+
         if cache_reset_task is not None:
             await cache_reset_task
         torch.cuda.empty_cache()
@@ -287,6 +347,7 @@ class DeepSpeedCriticWorkerBase(CriticWorkerBase):
             init_value_head=self.cfg.trainer.policy.model.path == self.cfg.trainer.critic.model.path,
             sequence_parallel_size=self.sequence_parallel_size,
             use_sample_packing=self.cfg.trainer.use_sample_packing,
+            modalities_config=self.cfg.trainer.modalities,
         )
         # configure optimizer
         critic_optim = strategy.create_optimizer(
@@ -349,6 +410,7 @@ class DeepSpeedRefWorkerBase(RefWorkerBase):
             ds_config=strategy.get_ds_eval_config(),
             sequence_parallel_size=self.sequence_parallel_size,
             use_sample_packing=self.cfg.trainer.use_sample_packing,
+            modalities_config=self.cfg.trainer.modalities,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

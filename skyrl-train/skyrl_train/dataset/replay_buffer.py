@@ -91,6 +91,7 @@ class Experience:
             self.action_mask = to(self.action_mask, device)
         if self.rollout_logprobs is not None:
             self.rollout_logprobs = to(self.rollout_logprobs, device)
+        # NOTE: Metadata holds high-level python objects (e.g., modality payloads) and stays on CPU.
 
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)
@@ -111,6 +112,7 @@ class Experience:
             self.action_mask = self.action_mask.pin_memory()
         if self.rollout_logprobs is not None:
             self.rollout_logprobs = self.rollout_logprobs.pin_memory()
+        # Metadata contains CPU-side objects; do not pin to avoid moving modality payloads off host.
         return self
 
 

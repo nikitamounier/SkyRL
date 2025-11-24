@@ -3,11 +3,12 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from copy import deepcopy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from loguru import logger
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
@@ -15,10 +16,18 @@ import transformers
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 import numpy as np
-from skyrl_train.distributed.ulysses.utils import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
+from skyrl_train.distributed.ulysses.utils import (
+    ulysses_pad_and_slice_inputs,
+    gather_outputs_and_unpad,
+    slice_input_tensor,
+)
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
 from flash_attn.bert_padding import pad_input, unpad_input
 from packaging.version import Version
+from skyrl_train.dataset.modalities import normalize_modalities_config
+from skyrl_train.modalities import ModalitiesManager
+from skyrl_train.modalities.types import SampleModalityData
+from skyrl_train.modalities.batching import build_modality_batches
 
 
 class HFModelWrapper(nn.Module):
@@ -63,6 +72,7 @@ class HFModelWrapper(nn.Module):
         sequence_parallel_size=1,
         use_sample_packing: bool = False,
         use_torch_compile: bool = False,
+        modalities_config: Optional[dict] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -75,6 +85,29 @@ class HFModelWrapper(nn.Module):
             assert (
                 self.attn_implementation == "flash_attention_2"
             ), "Flash attention 2 should be used for `use_sample_packing`"
+
+        self.modality_specs = normalize_modalities_config(modalities_config)
+        self.modalities_manager: Optional[ModalitiesManager] = (
+            ModalitiesManager(self.modality_specs) if self.modality_specs else None
+        )
+        self._modality_encoder_modules = nn.ModuleDict()
+        self._modality_projector_modules = nn.ModuleDict()
+        if self.modalities_manager is not None:
+            # Ensure the underlying HF module owns modality components so optimizer/state dicts capture them.
+            if hasattr(self.model, "_skyrl_modality_encoders"):
+                self._base_modality_encoder_modules = getattr(self.model, "_skyrl_modality_encoders")
+            else:
+                self._base_modality_encoder_modules = nn.ModuleDict()
+                self.model.add_module("_skyrl_modality_encoders", self._base_modality_encoder_modules)
+
+            if hasattr(self.model, "_skyrl_modality_projections"):
+                self._base_modality_projection_modules = getattr(self.model, "_skyrl_modality_projections")
+            else:
+                self._base_modality_projection_modules = nn.ModuleDict()
+                self.model.add_module("_skyrl_modality_projections", self._base_modality_projection_modules)
+        else:
+            self._base_modality_encoder_modules = None
+            self._base_modality_projection_modules = None
 
         if isinstance(pretrain_or_model, str):
             # Note: dschf is defined in function scope to avoid global effects
@@ -177,6 +210,19 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
+        if self.modalities_manager is not None:
+            for modality_id, role, module in self.modalities_manager.iter_handler_modules():
+                if not isinstance(module, nn.Module):
+                    continue
+                if role == "encoder":
+                    self._modality_encoder_modules[modality_id] = module
+                    if self._base_modality_encoder_modules is not None:
+                        self._base_modality_encoder_modules[modality_id] = module
+                elif role == "projection":
+                    self._modality_projector_modules[modality_id] = module
+                    if self._base_modality_projection_modules is not None:
+                        self._base_modality_projection_modules[modality_id] = module
+
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
         self.chunked_entropy_from_logits_fn = (
@@ -186,12 +232,18 @@ class HFModelWrapper(nn.Module):
         )
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, **kwargs) -> Union[
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        modalities_metadata: Optional[List[SampleModalityData]] = None,
+        **kwargs,
+    ) -> Union[
         Tuple[torch.LongTensor, torch.LongTensor],
         Tuple[torch.LongTensor, torch.LongTensor, torch.BoolTensor],
     ]:
+        modalities_metadata = kwargs.pop("modalities_metadata", modalities_metadata)
+        provided_inputs_embeds = kwargs.pop("inputs_embeds", None)
         generate_args = {
-            "input_ids": input_ids,
             "top_k": kwargs.get("top_k", None),
             "top_p": kwargs.get("top_p", None),
             "min_p": kwargs.get("min_p", None),
@@ -210,6 +262,17 @@ class HFModelWrapper(nn.Module):
             generate_args["max_new_tokens"] = kwargs.get("max_new_tokens")
         if kwargs.get("max_length", None):
             generate_args["max_length"] = kwargs.get("max_length")
+
+        use_modalities = self.modalities_manager is not None and modalities_metadata is not None
+        if provided_inputs_embeds is not None:
+            generate_args["inputs_embeds"] = provided_inputs_embeds
+        elif use_modalities:
+            inputs_embeds, _ = self.prepare_inputs_embeds(
+                input_ids, modalities_metadata=modalities_metadata, update_metadata=False
+            )
+            generate_args["inputs_embeds"] = inputs_embeds
+        else:
+            generate_args["input_ids"] = input_ids
 
         # Call generate
         sequences = self.model.generate(**generate_args)
@@ -261,6 +324,94 @@ class HFModelWrapper(nn.Module):
 
         return sequences, attention_mask, action_mask
 
+    def prepare_inputs_embeds(
+        self,
+        input_ids: torch.LongTensor,
+        modalities_metadata: Optional[List[SampleModalityData]] = None,
+        *,
+        update_metadata: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[List[SampleModalityData]]]:
+        """
+        Build input embeddings, optionally injecting modality-specific projections in place of placeholder tokens.
+
+        Args:
+            input_ids: Token ids for the batch (batch, seq_len)
+            modalities_metadata: Per-sample modality metadata describing placeholder spans and payloads.
+            update_metadata: Whether to allow modality handlers to update the supplied metadata with encoder/projector outputs.
+
+        Returns:
+            Tuple of (inputs_embeds, modalities_metadata). The metadata list is returned unchanged unless
+            `update_metadata=True`, in which case the same list (potentially mutated) is returned.
+        """
+        embedding_layer = self.model.get_input_embeddings()
+        if embedding_layer is None:
+            raise RuntimeError("Underlying model does not expose input embeddings.")
+        base_embeddings = embedding_layer(input_ids)
+
+        if self.modalities_manager is None or not modalities_metadata:
+            return base_embeddings, modalities_metadata
+
+        batch_size = input_ids.size(0)
+        if len(modalities_metadata) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} modality metadata entries, but received {len(modalities_metadata)}."
+            )
+
+        samples_metadata: List[SampleModalityData] = []
+        for idx, meta in enumerate(modalities_metadata):
+            if not isinstance(meta, SampleModalityData):
+                raise TypeError(
+                    f"Modalities metadata at index {idx} must be a SampleModalityData instance; got {type(meta).__name__}."
+                )
+            samples_metadata.append(meta)
+
+        if not any(meta.plans for meta in samples_metadata):
+            return base_embeddings, modalities_metadata
+
+        modality_batches = build_modality_batches(samples_metadata)
+        if not modality_batches:
+            return base_embeddings, modalities_metadata
+
+        replacements = self.modalities_manager.compute_embeddings(
+            modality_batches,
+            samples_metadata,
+            target_device=base_embeddings.device,
+            target_dtype=base_embeddings.dtype,
+            non_blocking=True,
+            update_metadata=update_metadata,
+        )
+        if not replacements:
+            return base_embeddings, modalities_metadata
+
+        updated_embeddings = base_embeddings.clone()
+        seq_len = updated_embeddings.size(1)
+        hidden_size = updated_embeddings.size(2)
+        for sample_idx, span_list in replacements.items():
+            if sample_idx >= batch_size:
+                raise ValueError(
+                    f"Replacement requested for sample index {sample_idx}, but batch size is {batch_size}."
+                )
+            for (start, length), tensor in span_list:
+                if start < 0 or length <= 0:
+                    raise ValueError(
+                        f"Invalid replacement span (start={start}, length={length}) for sample {sample_idx}."
+                    )
+                if start + length > seq_len:
+                    raise ValueError(
+                        f"Replacement span (start={start}, length={length}) exceeds sequence length {seq_len}."
+                    )
+                if tensor.shape[0] != length:
+                    raise ValueError(
+                        f"Projected embedding length mismatch: expected {length}, got {tensor.shape[0]}."
+                    )
+                if tensor.shape[1] != hidden_size:
+                    raise ValueError(
+                        f"Projected embedding hidden size mismatch: expected {hidden_size}, got {tensor.shape[1]}."
+                    )
+                updated_embeddings[sample_idx, start : start + length, :] = tensor
+
+        return updated_embeddings, samples_metadata if update_metadata else modalities_metadata
+
     def forward(
         self,
         sequences: torch.LongTensor,
@@ -269,14 +420,30 @@ class HFModelWrapper(nn.Module):
         temperature: float = 1.0,
         return_output=False,
         compute_entropy=False,
+        *,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        modalities_metadata: Optional[List[SampleModalityData]] = None,
+        update_modalities_metadata: bool = False,
     ) -> torch.Tensor:
         """Returns action log probs"""
+        if attention_mask is None:
+            attention_mask = torch.ones_like(sequences, dtype=torch.long)
+
+        metadata_result = modalities_metadata
+        if inputs_embeds is None:
+            inputs_embeds, metadata_result = self.prepare_inputs_embeds(
+                sequences,
+                modalities_metadata=modalities_metadata,
+                update_metadata=update_modalities_metadata,
+            )
+
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
 
         sequences_fwd = sequences
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
+        inputs_embeds_fwd = inputs_embeds
         if self.use_sample_packing:
             with torch.no_grad():
                 # Removes padding to get a packed tensor. `unpad_input` expects 3 dimensional tensor so we unsqueeze first
@@ -289,6 +456,10 @@ class HFModelWrapper(nn.Module):
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
                 attention_mask_fwd = None  # no attention mask with FA 2
+
+            if inputs_embeds_fwd is not None:
+                inputs_embeds_unpacked, _, _, _, _ = unpad_input(inputs_embeds_fwd, attention_mask=attention_mask)
+                inputs_embeds_fwd = inputs_embeds_unpacked.unsqueeze(0)
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
         if self.sequence_parallel_size > 1:
@@ -303,14 +474,28 @@ class HFModelWrapper(nn.Module):
             sequences_rolled, _, _, _ = ulysses_pad_and_slice_inputs(
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
+            if inputs_embeds_fwd is not None:
+                if pad_size > 0:
+                    inputs_embeds_fwd = F.pad(inputs_embeds_fwd, (0, 0, 0, pad_size))
+                inputs_embeds_fwd = slice_input_tensor(inputs_embeds_fwd, dim=1, padding=False)
 
         # NOTE (sumanthrh): Once we have position_ids, we don't need attention mask with flash attention.
         if self.use_sample_packing and self.attn_implementation == "flash_attention_2":
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
-            output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
+            if inputs_embeds_fwd is not None:
+                output = self.model(attention_mask=None, position_ids=position_ids_fwd, inputs_embeds=inputs_embeds_fwd)
+            else:
+                output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
         else:
-            output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+            if inputs_embeds_fwd is not None:
+                output = self.model(
+                    attention_mask=attention_mask_fwd,
+                    position_ids=position_ids_fwd,
+                    inputs_embeds=inputs_embeds_fwd,
+                )
+            else:
+                output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
@@ -365,6 +550,12 @@ class HFModelWrapper(nn.Module):
 
             output["entropy"] = entropy_BS
 
+        if metadata_result is not None:
+            try:
+                output["modalities_metadata"] = metadata_result
+            except TypeError:
+                setattr(output, "modalities_metadata", metadata_result)
+
         if isinstance(num_actions, list):
             if len(num_actions) == 1:
                 num_actions = num_actions[0]
@@ -405,6 +596,7 @@ def _get_critic_model(
     value_head_prefix="value_head",
     sequence_parallel_size=1,
     use_sample_packing: bool = False,
+    modalities_config: Optional[dict] = None,
 ):
     class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
@@ -426,18 +618,144 @@ def _get_critic_model(
             if self.sequence_parallel_size > 1:
                 logger.info("Critic model using sequence parallelism with size: ", self.sequence_parallel_size)
 
+            self.modality_specs = normalize_modalities_config(modalities_config)
+            self.modalities_manager: Optional[ModalitiesManager] = (
+                ModalitiesManager(self.modality_specs) if self.modality_specs else None
+            )
+            self._modality_encoder_modules = nn.ModuleDict()
+            self._modality_projector_modules = nn.ModuleDict()
+            if self.modalities_manager is not None:
+                if hasattr(self, "_skyrl_modality_encoders"):
+                    base_encoders = getattr(self, "_skyrl_modality_encoders")
+                else:
+                    base_encoders = nn.ModuleDict()
+                    self.add_module("_skyrl_modality_encoders", base_encoders)
+                if hasattr(self, "_skyrl_modality_projections"):
+                    base_projections = getattr(self, "_skyrl_modality_projections")
+                else:
+                    base_projections = nn.ModuleDict()
+                    self.add_module("_skyrl_modality_projections", base_projections)
+            else:
+                base_encoders = None
+                base_projections = None
+            if self.modalities_manager is not None:
+                for modality_id, role, module in self.modalities_manager.iter_handler_modules():
+                    if not isinstance(module, nn.Module):
+                        continue
+                    if role == "encoder":
+                        self._modality_encoder_modules[modality_id] = module
+                        if base_encoders is not None:
+                            base_encoders[modality_id] = module
+                    elif role == "projection":
+                        self._modality_projector_modules[modality_id] = module
+                        if base_projections is not None:
+                            base_projections[modality_id] = module
+
+        def prepare_inputs_embeds(
+            self,
+            input_ids: torch.LongTensor,
+            modalities_metadata: Optional[List[SampleModalityData]] = None,
+            *,
+            update_metadata: bool = False,
+        ) -> Tuple[torch.Tensor, Optional[List[SampleModalityData]]]:
+            embedding_layer = self.get_input_embeddings()
+            if embedding_layer is None:
+                raise RuntimeError("Underlying model does not expose input embeddings.")
+            base_embeddings = embedding_layer(input_ids)
+
+            if self.modalities_manager is None or not modalities_metadata:
+                return base_embeddings, modalities_metadata
+
+            batch_size = input_ids.size(0)
+            if len(modalities_metadata) != batch_size:
+                raise ValueError(
+                    f"Expected {batch_size} modality metadata entries, got {len(modalities_metadata)}."
+                )
+
+            samples_metadata: List[SampleModalityData] = []
+            for idx, meta in enumerate(modalities_metadata):
+                if not isinstance(meta, SampleModalityData):
+                    raise TypeError(
+                        f"Modalities metadata at index {idx} must be a SampleModalityData instance; "
+                        f"got {type(meta).__name__}."
+                    )
+                samples_metadata.append(meta)
+
+            if not any(meta.plans for meta in samples_metadata):
+                return base_embeddings, modalities_metadata
+
+            modality_batches = build_modality_batches(samples_metadata)
+            if not modality_batches:
+                return base_embeddings, modalities_metadata
+
+            replacements = self.modalities_manager.compute_embeddings(
+                modality_batches,
+                samples_metadata,
+                target_device=base_embeddings.device,
+                target_dtype=base_embeddings.dtype,
+                non_blocking=True,
+                update_metadata=update_metadata,
+            )
+            if not replacements:
+                return base_embeddings, modalities_metadata
+
+            updated_embeddings = base_embeddings.clone()
+            seq_len = updated_embeddings.size(1)
+            hidden_size = updated_embeddings.size(2)
+            for sample_idx, span_list in replacements.items():
+                if sample_idx >= batch_size:
+                    raise ValueError(
+                        f"Replacement requested for sample index {sample_idx}, but batch size is {batch_size}."
+                    )
+                for (start, length), tensor in span_list:
+                    if start < 0 or length <= 0:
+                        raise ValueError(
+                            f"Invalid replacement span (start={start}, length={length}) for sample {sample_idx}."
+                        )
+                    if start + length > seq_len:
+                        raise ValueError(
+                            f"Replacement span (start={start}, length={length}) exceeds sequence length {seq_len}."
+                        )
+                    if tensor.shape[0] != length:
+                        raise ValueError(
+                            f"Projected embedding length mismatch: expected {length}, got {tensor.shape[0]}."
+                        )
+                    if tensor.shape[1] != hidden_size:
+                        raise ValueError(
+                            f"Projected embedding hidden size mismatch: expected {hidden_size}, got {tensor.shape[1]}."
+                        )
+                    updated_embeddings[sample_idx, start : start + length, :] = tensor
+
+            return updated_embeddings, samples_metadata if update_metadata else modalities_metadata
+
         def forward(
             self,
             input_ids: torch.LongTensor = None,
             num_actions: Optional[Union[int, list[int]]] = None,
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
+            *,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            modalities_metadata: Optional[List[SampleModalityData]] = None,
+            update_modalities_metadata: bool = False,
         ) -> torch.Tensor:
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+            metadata_result = modalities_metadata
+            if inputs_embeds is None and input_ids is not None:
+                inputs_embeds, metadata_result = self.prepare_inputs_embeds(
+                    input_ids,
+                    modalities_metadata=modalities_metadata,
+                    update_metadata=update_modalities_metadata,
+                )
+
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             input_ids_fwd = input_ids
             position_ids_fwd = position_ids
             attention_mask_fwd = attention_mask
+            inputs_embeds_fwd = inputs_embeds
 
             if self.use_sample_packing:
                 with torch.no_grad():
@@ -454,6 +772,9 @@ def _get_critic_model(
                     position_ids_fwd = position_ids_fwd.transpose(0, 1)
                     # don't use attention mask with FA2
                     attention_mask_fwd = None
+                if inputs_embeds_fwd is not None:
+                    inputs_embeds_unpacked, _, _, _, _ = unpad_input(inputs_embeds_fwd, attention_mask=attention_mask)
+                    inputs_embeds_fwd = inputs_embeds_unpacked.unsqueeze(0)
 
             if self.sequence_parallel_size > 1:
                 assert self.use_sample_packing, "sample packing must be true for sequence parallelism"
@@ -464,13 +785,27 @@ def _get_critic_model(
                 input_ids_fwd, position_ids_fwd, attention_mask_fwd, pad_size = ulysses_pad_and_slice_inputs(
                     input_ids_fwd, position_ids_fwd, attention_mask_fwd, self.sequence_parallel_size
                 )
+                if inputs_embeds_fwd is not None:
+                    if pad_size > 0:
+                        inputs_embeds_fwd = F.pad(inputs_embeds_fwd, (0, 0, 0, pad_size))
+                    inputs_embeds_fwd = slice_input_tensor(inputs_embeds_fwd, dim=1, padding=False)
 
             if self.sequence_parallel_size > 1 and self.config._attn_implementation == "flash_attention_2":
-                outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
+                if inputs_embeds_fwd is not None:
+                    outputs = getattr(self, self.base_model_prefix)(
+                        position_ids=position_ids_fwd, inputs_embeds=inputs_embeds_fwd
+                    )
+                else:
+                    outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
             else:
-                outputs = getattr(self, self.base_model_prefix)(
-                    input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
-                )
+                if inputs_embeds_fwd is not None:
+                    outputs = getattr(self, self.base_model_prefix)(
+                        attention_mask=attention_mask_fwd, position_ids=position_ids_fwd, inputs_embeds=inputs_embeds_fwd
+                    )
+                else:
+                    outputs = getattr(self, self.base_model_prefix)(
+                        input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
+                    )
             last_hidden_states_BSH = outputs["last_hidden_state"]
 
             if self.sequence_parallel_size > 1:
@@ -496,6 +831,12 @@ def _get_critic_model(
                 return outputs
 
             action_values = values[:, -num_actions:]
+
+            if metadata_result is not None:
+                try:
+                    outputs["modalities_metadata"] = metadata_result
+                except TypeError:
+                    setattr(outputs, "modalities_metadata", metadata_result)
 
             if return_output:
                 return (action_values, outputs)
@@ -525,6 +866,7 @@ def get_llm_for_sequence_regression(
     device_map=None,
     sequence_parallel_size=1,
     use_sample_packing: bool = False,
+    modalities_config: Optional[dict] = None,
     **kwargs,
 ) -> nn.Module:
     """Get transformer with a sequence classification head on top (linear layer).
@@ -553,6 +895,7 @@ def get_llm_for_sequence_regression(
         value_head_prefix,
         sequence_parallel_size=sequence_parallel_size,
         use_sample_packing=use_sample_packing,
+        modalities_config=modalities_config,
     )
 
     # Note: dschf is defined in function scope to avoid global effects

@@ -37,6 +37,16 @@ __all__ = ["BasePPOExp", "config_dir"]
 def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_pg, tokenizer: PreTrainedTokenizerBase):
     from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 
+    engine_init_kwargs = OmegaConf.to_container(cfg.generator.engine_init_kwargs, resolve=True)
+    if not isinstance(engine_init_kwargs, dict):
+        engine_init_kwargs = dict(engine_init_kwargs or {})
+    engine_init_kwargs.setdefault("modalities_config", cfg.modalities)
+    if cfg.modalities:
+        engine_init_kwargs.setdefault("enable_prompt_embeds", True)
+        if cfg.generator.enable_prefix_caching:
+            logger.warning("Modalities enabled; disabling prefix caching for vLLM compatibility.")
+            cfg.generator.enable_prefix_caching = False
+
     engine_kwargs = {
         "num_inference_engines": cfg.generator.num_inference_engines,
         "tensor_parallel_size": cfg.generator.inference_engine_tensor_parallel_size,
@@ -57,7 +67,7 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
         "max_num_seqs": cfg.generator.max_num_seqs,
         "tokenizer": tokenizer,
         "backend": cfg.generator.backend,
-        "engine_init_kwargs": cfg.generator.engine_init_kwargs,
+        "engine_init_kwargs": engine_init_kwargs,
     }
 
     # Conditionally add LoRA parameters if LoRA is enabled
@@ -125,6 +135,7 @@ class BasePPOExp:
             tokenizer=self.tokenizer,
             max_prompt_length=self.cfg.trainer.max_prompt_length,
             num_workers=8,
+            modalities_config=self.cfg.modalities,
         )
         # make sure the dataset is large enough to train on
         assert (
@@ -144,6 +155,7 @@ class BasePPOExp:
                 tokenizer=self.tokenizer,
                 max_prompt_length=self.cfg.trainer.max_prompt_length,
                 num_workers=8,
+                modalities_config=self.cfg.modalities,
             )
             return prompts_dataset
         return None
@@ -187,6 +199,7 @@ class BasePPOExp:
             inference_engine_client=inference_engine_client,
             tokenizer=tokenizer,
             model_name=cfg.trainer.policy.model.path,
+            modalities_config=cfg.generator.modalities,
         )
 
     def get_trainer(
