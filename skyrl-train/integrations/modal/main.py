@@ -15,6 +15,20 @@ def _find_local_repo_root() -> Path:
                 return base
     raise Exception("SkyRL root repo path not found")
 
+def create_modal_volume(
+    data_volume_name: str = "skyrl-data",
+    cache_volume_name: str = "skyrl-cache",
+):
+    data_vol = modal.Volume.from_name(data_volume_name, create_if_missing=True)
+    cache_vol = modal.Volume.from_name(cache_volume_name, create_if_missing=True)
+    return {
+        "/root/data": data_vol,
+        "/root/.cache/uv": cache_vol,
+        "/root/.cache/pip": cache_vol,
+        "/root/.cache/huggingface": cache_vol,
+    }
+
+
 
 def create_modal_image() -> modal.Image:
     """
@@ -26,6 +40,10 @@ def create_modal_image() -> modal.Image:
 
     envs = {
         "SKYRL_REPO_ROOT": "/root/SkyRL",
+        "UV_CACHE_DIR": "/root/.cache/uv",
+        "PIP_CACHE_DIR": "/root/.cache/pip",
+        "HF_HOME": "/root/.cache/huggingface",
+        "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
     }
 
     return (
@@ -134,6 +152,7 @@ def run_cpu(command: str):
     timeout=int(os.environ.get("MODAL_GPU_TIMEOUT_SEC", 60 * 60 * 24)),  # 24h default
     cpu=int(os.environ.get("MODAL_GPU_CPU", 16)),
     memory=int(os.environ.get("MODAL_GPU_MEM_MIB", 128 * 1024)),
+    secrets=[modal.Secret.from_name("wandb")]
 )
 def run_gpu(command: str):
     _run_in_skyrl_train(command, start_ray=True)

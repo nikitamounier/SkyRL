@@ -18,13 +18,13 @@ set -x
 
 DATA_DIR="${DATA_DIR:-/root/data/gsm8k_modal_text}"
 CKPT_DIR="${CKPT_DIR:-/root/data/ckpts/gsm8k_0.5b_modal_text_lora_ckpt}"
-NUM_GPUS="${NUM_GPUS:-4}"s
+NUM_GPUS="${NUM_GPUS:-4}"
 LOGGER="${LOGGER:-wandb}"  # change to "console" to print to stdout
 INFERENCE_BACKEND="vllm"
 MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
 PLACEHOLDER_TOKEN="<|extra_0|>"
 
-uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
+uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator="grpo" \
@@ -54,7 +54,7 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   generator.backend=$INFERENCE_BACKEND \
   generator.run_engines_locally=true \
   generator.weight_sync_backend=nccl \
-  generator.async_engine=true \
+  generator.async_engine=false \
   generator.batched=true \
   environment.env_class=gsm8k \
   generator.n_samples_per_prompt=5 \
@@ -64,12 +64,12 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   trainer.run_name="gsm8k_0.5b_modal_text_lora" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$CKPT_DIR" \
-  modalities.text_mod.placeholder_token="$PLACEHOLDER_TOKEN" \
-  modalities.text_mod.max_placeholder_tokens=2048 \
-  modalities.text_mod.encoder.target="skyrl_train.examples.modalities.text_passthrough_handlers:TokenIdListEncoder" \
-  modalities.text_mod.encoder.kwargs.model_path="$MODEL_PATH" \
-  modalities.text_mod.projection.target="skyrl_train.examples.modalities.text_passthrough_handlers:EmbeddingLookupProjection" \
-  modalities.text_mod.projection.kwargs.model_path="$MODEL_PATH" \
-  modalities.text_mod.trainable.encoder=false \
-  modalities.text_mod.trainable.projection=false \
+  +modalities.text_mod.placeholder_token="'$PLACEHOLDER_TOKEN'" \
+  +modalities.text_mod.max_placeholder_tokens=2048 \
+  +modalities.text_mod.encoder.target="skyrl_train.examples.modalities.text_passthrough_handlers:TokenIdListEncoder" \
+  +modalities.text_mod.encoder.kwargs.model_path="$MODEL_PATH" \
+  +modalities.text_mod.projection.target="skyrl_train.examples.modalities.text_passthrough_handlers:EmbeddingLookupProjection" \
+  +modalities.text_mod.projection.kwargs.model_path="$MODEL_PATH" \
+  +modalities.text_mod.trainable.encoder=false \
+  +modalities.text_mod.trainable.projection=false \
   $@
