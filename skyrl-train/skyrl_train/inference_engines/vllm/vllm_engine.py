@@ -1,5 +1,5 @@
 import os
-from typing import List, Any, Dict, Optional, Sequence, Tuple
+from typing import List, Any, Dict, Optional, Sequence, Tuple, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 import ray
@@ -341,6 +341,53 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             return
         await asyncio.to_thread(self._refresh_prompt_embedding_from_engine)
 
+    def _apply_local_modalities_weights(self, request: NamedWeightsUpdateRequest) -> None:
+        """Keep driver-side modality modules in sync when weights are pushed."""
+        manager = getattr(self, "modalities_manager", None)
+        if manager is None or not manager.has_modalities():
+            return
+
+        if not torch.cuda.is_available():
+            logger.warning("Skipping driver-side modality weight update because CUDA is unavailable.")
+            return
+
+        names = request.get("names", [])
+        extras = request.get("extras") or []
+        missing_payload = False
+
+        for idx, name in enumerate(names):
+            if not name.startswith("modalities."):
+                continue
+
+            payload: Optional[Mapping[str, Any]] = extras[idx] if idx < len(extras) else None
+            ipc_handles = payload.get("ipc_handles") if isinstance(payload, Mapping) else None
+            if not ipc_handles:
+                missing_payload = True
+                continue
+
+            device = torch.cuda.current_device()
+            physical_gpu_id = str(torch.cuda.get_device_properties(device).uuid)
+            handle = ipc_handles.get(physical_gpu_id)
+            if handle is None:
+                missing_payload = True
+                continue
+
+            func, args = handle
+            list_args = list(args)
+            # align with the current device
+            list_args[6] = device
+            weight = func(*list_args)
+            updated = manager.set_named_parameter(name, weight)
+            if not updated:
+                logger.warning("Failed to update driver-side modality weight `%s`", name)
+            del weight
+
+        if missing_payload:
+            logger.warning(
+                "Received modality weight update without IPC payloads for driver; "
+                "driver-side modality modules may be stale. Enable CUDA IPC for modality weights."
+            )
+
     def _prepare_prompt_inputs(
         self,
         prompt_token_ids: List[List[int]],
@@ -533,6 +580,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                 ),
             )
             await self._maybe_refresh_prompt_embeddings(request["names"])
+            self._apply_local_modalities_weights(request)
             return result
         else:
             assert (
@@ -542,6 +590,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                 engine.collective_rpc, "update_weights", args=(request["names"], request["dtypes"], request["shapes"])
             )
             await self._maybe_refresh_prompt_embeddings(request["names"])
+            self._apply_local_modalities_weights(request)
             return result
 
     async def teardown(self):
@@ -703,7 +752,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         is_ipc = request.get("extras") and "ipc_handles" in request["extras"][0]
 
         if is_ipc:
-            return await engine.collective_rpc(
+            result = await engine.collective_rpc(
                 "update_weights_cuda_ipc",
                 args=(
                     request["names"],
@@ -712,11 +761,13 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                     [extra["ipc_handles"] for extra in request["extras"]],
                 ),
             )
+            self._apply_local_modalities_weights(request)
+            return result
         else:
             assert (
                 len(request["names"]) == 1
             ), f"Update weights without cuda IPC only supports a single named weight at a time , got request with {len(request['names'])} entries"
-            return await engine.collective_rpc(
+            result = await engine.collective_rpc(
                 "update_weights",
                 args=(
                     request["names"],
@@ -724,6 +775,8 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                     request["shapes"],
                 ),
             )
+            self._apply_local_modalities_weights(request)
+            return result
 
     async def teardown(self):
         await self._destroy_weights_update_group()

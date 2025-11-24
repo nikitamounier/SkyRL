@@ -40,12 +40,15 @@ def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_p
     engine_init_kwargs = OmegaConf.to_container(cfg.generator.engine_init_kwargs, resolve=True)
     if not isinstance(engine_init_kwargs, dict):
         engine_init_kwargs = dict(engine_init_kwargs or {})
-    engine_init_kwargs.setdefault("modalities_config", cfg.modalities)
-    if cfg.modalities:
-        engine_init_kwargs.setdefault("enable_prompt_embeds", True)
-        if cfg.generator.enable_prefix_caching:
-            logger.warning("Modalities enabled; disabling prefix caching for vLLM compatibility.")
-            cfg.generator.enable_prefix_caching = False
+    if cfg.generator.backend == "vllm":
+        engine_init_kwargs.setdefault("modalities_config", cfg.modalities)
+        if cfg.modalities:
+            engine_init_kwargs.setdefault("enable_prompt_embeds", True)
+            if cfg.generator.enable_prefix_caching:
+                logger.warning("Modalities enabled; disabling prefix caching for vLLM compatibility.")
+                cfg.generator.enable_prefix_caching = False
+    else:
+        engine_init_kwargs.pop("modalities_config", None)
 
     engine_kwargs = {
         "num_inference_engines": cfg.generator.num_inference_engines,
