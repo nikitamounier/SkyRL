@@ -21,7 +21,7 @@ CKPT_DIR="${CKPT_DIR:-/root/data/ckpts/gsm8k_0.5b_modal_text_lora_ckpt}"
 NUM_GPUS="${NUM_GPUS:-4}"
 LOGGER="${LOGGER:-wandb}"  # change to "console" to print to stdout
 INFERENCE_BACKEND="vllm"
-MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_PATH="Qwen/Qwen3-0.6B"
 PLACEHOLDER_TOKEN="<|extra_0|>"
 
 uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
