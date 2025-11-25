@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from skyrl_train.dataset.modalities import ModalityEmbeddingSpan, ModalityPlaceholderPlan
+if TYPE_CHECKING:
+    from skyrl_train.dataset.modalities import ModalityEmbeddingSpan, ModalityPlaceholderPlan
 
 
 @dataclass

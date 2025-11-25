@@ -446,7 +446,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
 
     def _get_engine(self):
         """Get the underlying engine for RPC calls."""
-        return self.llm.engine if hasattr(self.llm, "engine") else self.llm
+        return self.llm.llm_engine if hasattr(self.llm, "llm_engine") else self.llm
 
     def _is_lora_disk_loading_request(self, request: NamedWeightsUpdateRequest) -> bool:
         """Check if this is a LoRA disk loading request."""

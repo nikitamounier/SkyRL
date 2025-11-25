@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from loguru import logger
 
-from skyrl_train.dataset.modalities import ModalityPlaceholderPlan
-from skyrl_train.modalities.types import SampleModalityData
+if TYPE_CHECKING:
+    from skyrl_train.dataset.modalities import ModalityPlaceholderPlan
+    from skyrl_train.modalities.types import SampleModalityData
 
 
 @dataclass
@@ -35,7 +36,7 @@ class ModalityBatch:
         return len(self.occurrences)
 
 
-def _split_payload(plan: ModalityPlaceholderPlan) -> List[Any]:
+def _split_payload(plan: "ModalityPlaceholderPlan") -> List[Any]:
     occurrences = plan.occurrences
     if occurrences == 0:
         return []
@@ -59,7 +60,7 @@ def _split_payload(plan: ModalityPlaceholderPlan) -> List[Any]:
     return values[:occurrences]
 
 
-def populate_sample_occurrences(sample: SampleModalityData) -> None:
+def populate_sample_occurrences(sample: "SampleModalityData") -> None:
     """Ensure occurrence-level payload lists are computed for a sample."""
     if not sample.plans:
         return
