@@ -47,7 +47,7 @@ def create_modal_image() -> modal.Image:
     }
 
     return (
-        modal.Image.from_registry("novaskyai/skyrl-train-ray-2.49.0-py3.12-cu12.8")
+        modal.Image.from_registry("novaskyai/skyrl-train-ray-2.51.1-py3.12-cu12.8")
         .env(envs)
         # 👇 these are missing in the base image, needed for prepare_modal_text_split.py
         .pip_install("datasets", "transformers")
