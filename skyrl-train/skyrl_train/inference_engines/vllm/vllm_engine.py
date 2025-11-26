@@ -218,8 +218,15 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         model_config = engine.model_config
 
         hidden_size = getattr(model_config, "hidden_size", None)
-        if hidden_size is None:
+        if not hidden_size and hasattr(model_config, "get_hidden_size"):
+            hidden_size = model_config.get_hidden_size()
+        if not hidden_size and hasattr(model_config, "hf_config"):
+            hidden_size = getattr(model_config.hf_config, "hidden_size", None)
+        if not hidden_size and hasattr(model_config, "hf_text_config"):
+            hidden_size = getattr(model_config.hf_text_config, "hidden_size", None)
+        if not hidden_size:
             raise ValueError("Unable to determine model hidden size for prompt embedding builder.")
+
 
         dtype_str = str(getattr(model_config, "dtype", "float32"))
         target_dtype = str_to_torch_dtype(dtype_str)
@@ -321,16 +328,46 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             if model_runner is None:
                 return
             model = getattr(model_runner, "model", None)
-            if model is None or not hasattr(model, "get_input_embeddings"):
+            if model is None:
                 return
-            embedding_module = model.get_input_embeddings()
-            if embedding_module is None or not hasattr(embedding_module, "weight"):
-                return
-            weight = embedding_module.weight.detach().cpu()
-            builder.set_base_embedding(weight)
-            logger.debug("Prompt embedding table refreshed from vLLM model weights.")
+
+            candidates = []
+            for cand in (
+                model,
+                getattr(model, "model", None),
+                getattr(model, "module", None),
+                getattr(model, "_orig_mod", None),
+            ):
+                if cand is not None and cand not in candidates:
+                    candidates.append(cand)
+
+            for cand in candidates:
+                embedding_module = None
+                if hasattr(cand, "get_input_embeddings"):
+                    try:
+                        embedding_module = cand.get_input_embeddings()
+                    except TypeError:
+                        try:
+                            dummy = torch.zeros((1, 1), dtype=torch.long, device=builder.device)
+                            embedding_module = cand.get_input_embeddings(dummy)
+                        except TypeError:
+                            embedding_module = None
+                if embedding_module is None and hasattr(cand, "embed_tokens"):
+                    embedding_module = cand.embed_tokens
+                if (
+                    embedding_module is None
+                    and hasattr(cand, "model")
+                    and hasattr(cand.model, "embed_tokens")
+                ):
+                    embedding_module = cand.model.embed_tokens
+                if embedding_module is not None and hasattr(embedding_module, "weight"):
+                    weight = embedding_module.weight.detach().cpu()
+                    builder.set_base_embedding(weight)
+                    logger.debug("Prompt embedding table refreshed from vLLM model weights.")
+                    return
         except Exception:
             logger.exception("Failed to refresh prompt embedding table from vLLM engine.")
+
 
     async def _maybe_refresh_prompt_embeddings(self, names: Sequence[str]) -> None:
         builder = getattr(self, "prompt_embedding_builder", None)
@@ -523,7 +560,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         await asyncio.to_thread(self.llm.wake_up, tags=kwargs.get("tags", None))
 
     async def sleep(self, *args: Any, **kwargs: Any):
-        engine = self._get_engine().llm_engine
+        engine = self._get_engine()
         output_processor = engine.output_processor
         if output_processor.has_unfinished_requests():
             logger.warning(

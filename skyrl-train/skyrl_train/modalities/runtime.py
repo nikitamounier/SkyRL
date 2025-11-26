@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from skyrl_train.dataset.modalities import ModalitySpec
+from skyrl_train.dataset.modalities import ModalitySpec, normalize_modalities_config
 from skyrl_train.modalities.batching import ModalityBatch, ModalityOccurrence
 from skyrl_train.modalities.handlers import (
     ModalityEncoderProtocol,
@@ -30,7 +30,10 @@ class ModalitiesManager:
     """Runtime helper that materializes modality embeddings for prompts."""
 
     def __init__(self, modality_specs: Mapping[str, ModalitySpec] | None):
-        self._specs: Dict[str, ModalitySpec] = dict(modality_specs or {})
+        specs = modality_specs or {}
+        if specs and not all(isinstance(spec, ModalitySpec) for spec in specs.values()):
+            specs = normalize_modalities_config(specs)
+        self._specs: Dict[str, ModalitySpec] = dict(specs)
         self._handlers: Dict[str, _HandlerBundle] = {}
 
         for modality_id, spec in self._specs.items():

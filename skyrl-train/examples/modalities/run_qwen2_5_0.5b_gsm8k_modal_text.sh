@@ -9,9 +9,9 @@ set -x
 
 # 1) Prepare the modal-text dataset (idempotent)
 #   uv run --isolated --extra transformers --extra datasets examples/modalities/prepare_modal_text_split.py \
-#     --model_path Qwen/Qwen2.5-0.5B-Instruct \
+#     --model_path Qwen/Qwen3-0.6B \
 #     --output_dir "/root/data/gsm8k_modal_text" \
-#     --placeholder_token "<|extra_0|>"
+#     --placeholder_token "<|image_pad|>"
 #
 # 2) Run training with modalities enabled (example Modal command):
 #   modal run main.py --command "WANDB_API_KEY=... DATA_DIR=/root/data/gsm8k_modal_text bash examples/modalities/run_qwen2_5_0.5b_gsm8k_modal_text.sh"

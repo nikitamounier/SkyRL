@@ -705,15 +705,31 @@ def torch_dtype_to_str(dtype: torch.dtype) -> str:
         return str(dtype)
 
 
-def str_to_torch_dtype(dtype: str) -> torch.dtype:
-    if dtype == "bfloat16":
-        return torch.bfloat16
-    elif dtype == "float16":
-        return torch.float16
-    elif dtype == "float32":
-        return torch.float32
-    else:
-        return torch.dtype(dtype)
+def str_to_torch_dtype(dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if not isinstance(dtype, str):
+        raise TypeError(f"Expected dtype as str or torch.dtype, got {type(dtype)}")
+
+    cleaned = dtype.strip()
+    if cleaned.startswith("torch."):
+        cleaned = cleaned.split(".", 1)[1]
+
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "float32": torch.float32,
+        "float": torch.float32,
+    }
+    if cleaned in mapping:
+        return mapping[cleaned]
+
+    try:
+        return getattr(torch, cleaned)
+    except AttributeError as exc:
+        raise ValueError(f"Unsupported torch dtype string: {dtype}") from exc
 
 
 def format_gib(mem_bytes: int) -> str:

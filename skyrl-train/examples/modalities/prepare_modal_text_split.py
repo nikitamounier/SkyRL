@@ -1,7 +1,9 @@
 """
 Create a GSM8K variant with a synthetic "text modality" for the first half of the samples.
-Each modified prompt appends a placeholder token, and the modality payload stores token ids for
-the original question so the modality pipeline can re-embed them.
+For modality samples, we move the first half of the tokenized prompt into a modality payload
+(list of token ids wrapped in a list for a single occurrence) and replace that span in the
+user message with a placeholder token. The modality pipeline re-embeds those tokens so the
+end-to-end multimodal path is exercised without introducing a real non-text modality.
 """
 
 import argparse
@@ -17,7 +19,20 @@ def build_sample(example: Dict[str, Any], idx: int, split: str, tokenizer, place
     answer_raw = example.pop("answer")
 
     content = question_raw + " Let's think step by step and output the final answer after \"####\"."
-    content_with_placeholder = f"{content} {placeholder}" if add_modality else content
+
+    modal_payload = None
+    content_with_placeholder = content
+    if add_modality:
+        token_ids = tokenizer.encode(content, add_special_tokens=False)
+        midpoint = max(1, len(token_ids) // 2)
+        modality_tokens = token_ids[:midpoint]
+        visible_tokens = token_ids[midpoint:]
+        visible_text = tokenizer.decode(visible_tokens, skip_special_tokens=True)
+        if visible_text and not visible_text[0].isspace():
+            visible_text = " " + visible_text
+        content_with_placeholder = f"{placeholder}{visible_text}"
+        # Wrap in a list so the modality pipeline treats this as a single occurrence payload.
+        modal_payload = [modality_tokens]
 
     data = {
         "data_source": "openai/gsm8k",
@@ -35,13 +50,9 @@ def build_sample(example: Dict[str, Any], idx: int, split: str, tokenizer, place
             "answer": answer_raw,
             "question": question_raw,
         },
-        # ✅ ALWAYS present
-        "modalities": {"text_mod": []},
+        # ✅ ALWAYS present (value is None for non-modality samples)
+        "modalities": {"text_mod": modal_payload},
     }
-
-    if add_modality:
-        token_ids = tokenizer.encode(content, add_special_tokens=False)
-        data["modalities"] = {"text_mod": token_ids}
 
     return data
 
@@ -72,9 +83,9 @@ def process_split(split_name: str, hf_split: str, tokenizer, placeholder: str, o
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model_path", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--output_dir", default="~/data/gsm8k_modal_text")
-    parser.add_argument("--placeholder_token", default="<|extra_0|>")
+    parser.add_argument("--placeholder_token", default="<|image_pad|>")
     args = parser.parse_args()
 
     output_dir = os.path.expanduser(args.output_dir)

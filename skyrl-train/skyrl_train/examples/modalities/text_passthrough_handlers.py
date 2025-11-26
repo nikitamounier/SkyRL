@@ -14,6 +14,7 @@ import torch
 from loguru import logger
 from safetensors import safe_open
 from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
 
 from skyrl_train.modalities.handlers import ModalityEncoderProtocol, ModalityProjectorProtocol
 
@@ -74,19 +75,43 @@ class EmbeddingLookupProjection(ModalityProjectorProtocol):
             )
         self.hidden_size = self.embedding_weight.shape[1]
 
+    def _resolve_model_dir(self) -> str:
+        if os.path.isdir(self.model_path):
+            return self.model_path
+        try:
+            local_dir = snapshot_download(
+                repo_id=self.model_path,
+                allow_patterns=("*.safetensors",),  # only what we need
+            )
+            logger.info(
+                "Resolved repo id `%s` to local snapshot `%s` for modality `%s`.",
+                self.model_path,
+                local_dir,
+                self.modality_id,
+            )
+            return local_dir
+        except Exception:
+            logger.exception(
+                "Failed to resolve repo id `%s`; falling back to raw path.",
+                self.model_path,
+            )
+            return self.model_path
+
     def _load_embedding_weight(self) -> Optional[torch.Tensor]:
+        model_dir = self._resolve_model_dir()
+
         candidate_files: List[str] = []
-        primary = os.path.join(self.model_path, "model.safetensors")
+        primary = os.path.join(model_dir, "model.safetensors")
         if os.path.isfile(primary):
             candidate_files.append(primary)
         else:
-            shard_pattern = os.path.join(self.model_path, "model-*.safetensors")
+            shard_pattern = os.path.join(model_dir, "model-*.safetensors")
             candidate_files.extend(sorted(glob.glob(shard_pattern)))
 
         if not candidate_files:
             logger.error(
                 "No safetensors checkpoint found under `%s` while initializing projection for modality `%s`.",
-                self.model_path,
+                model_dir,
                 self.modality_id,
             )
             return None
@@ -119,7 +144,7 @@ class EmbeddingLookupProjection(ModalityProjectorProtocol):
         logger.error(
             "Could not find any embedding weights %s in `%s` for modality `%s`.",
             self.embedding_weight_names,
-            self.model_path,
+            model_dir,
             self.modality_id,
         )
         return None

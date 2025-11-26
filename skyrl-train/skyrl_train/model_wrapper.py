@@ -92,22 +92,6 @@ class HFModelWrapper(nn.Module):
         )
         self._modality_encoder_modules = nn.ModuleDict()
         self._modality_projector_modules = nn.ModuleDict()
-        if self.modalities_manager is not None:
-            # Ensure the underlying HF module owns modality components so optimizer/state dicts capture them.
-            if hasattr(self.model, "_skyrl_modality_encoders"):
-                self._base_modality_encoder_modules = getattr(self.model, "_skyrl_modality_encoders")
-            else:
-                self._base_modality_encoder_modules = nn.ModuleDict()
-                self.model.add_module("_skyrl_modality_encoders", self._base_modality_encoder_modules)
-
-            if hasattr(self.model, "_skyrl_modality_projections"):
-                self._base_modality_projection_modules = getattr(self.model, "_skyrl_modality_projections")
-            else:
-                self._base_modality_projection_modules = nn.ModuleDict()
-                self.model.add_module("_skyrl_modality_projections", self._base_modality_projection_modules)
-        else:
-            self._base_modality_encoder_modules = None
-            self._base_modality_projection_modules = None
 
         if isinstance(pretrain_or_model, str):
             # Note: dschf is defined in function scope to avoid global effects
@@ -209,6 +193,23 @@ class HFModelWrapper(nn.Module):
             self.model.config.use_cache = False
         else:
             self.model = pretrain_or_model
+
+        if self.modalities_manager is not None:
+            # Ensure the underlying HF module owns modality components so optimizer/state dicts capture them.
+            if hasattr(self.model, "_skyrl_modality_encoders"):
+                self._base_modality_encoder_modules = getattr(self.model, "_skyrl_modality_encoders")
+            else:
+                self._base_modality_encoder_modules = nn.ModuleDict()
+                self.model.add_module("_skyrl_modality_encoders", self._base_modality_encoder_modules)
+
+            if hasattr(self.model, "_skyrl_modality_projections"):
+                self._base_modality_projection_modules = getattr(self.model, "_skyrl_modality_projections")
+            else:
+                self._base_modality_projection_modules = nn.ModuleDict()
+                self.model.add_module("_skyrl_modality_projections", self._base_modality_projection_modules)
+        else:
+            self._base_modality_encoder_modules = None
+            self._base_modality_projection_modules = None
 
         if self.modalities_manager is not None:
             for modality_id, role, module in self.modalities_manager.iter_handler_modules():
