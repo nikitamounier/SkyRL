@@ -22,7 +22,7 @@ NUM_GPUS="${NUM_GPUS:-4}"
 LOGGER="${LOGGER:-wandb}"  # change to "console" to print to stdout
 INFERENCE_BACKEND="vllm"
 MODEL_PATH="Qwen/Qwen3-0.6B"
-PLACEHOLDER_TOKEN="<|extra_0|>"
+PLACEHOLDER_TOKEN="<|image_pad|>"
 
 uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
