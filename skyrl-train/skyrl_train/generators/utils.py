@@ -185,12 +185,17 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput]) -> G
         for output in generator_outputs:
             metadata_list = output.get("modalities_metadata")
             if metadata_list is None:
-                raise ValueError("Expected modalities_metadata for all generator outputs when present in any output")
-            for metadata in metadata_list:
-                if hasattr(metadata, "clone"):
-                    aggregated.append(metadata.clone())
-                else:
-                    aggregated.append(copy.deepcopy(metadata))
+                # If this batch has no metadata but others do, assume empty/default metadata for these samples
+                # to maintain alignment with prompts/responses.
+                batch_size = len(output["prompt_token_ids"])
+                for _ in range(batch_size):
+                    aggregated.append(SampleModalityData())
+            else:
+                for metadata in metadata_list:
+                    if hasattr(metadata, "clone"):
+                        aggregated.append(metadata.clone())
+                    else:
+                        aggregated.append(copy.deepcopy(metadata))
         result["modalities_metadata"] = aggregated
 
     return result

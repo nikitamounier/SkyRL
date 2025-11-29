@@ -229,6 +229,17 @@ def calculate_per_dataset_metrics(
     return eval_metrics
 
 
+def sanitize_env_extras(extras: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize env_extras for JSON serialization."""
+    if not extras:
+        return extras
+    sanitized = extras.copy()
+    # Remove complex modality data which is not JSON serializable and too large
+    if "modalities" in sanitized:
+        del sanitized["modalities"]
+    return sanitized
+
+
 def dump_per_dataset_eval_results(
     dump_dir_path: Path,
     tokenizer: AutoTokenizer,
@@ -266,7 +277,7 @@ def dump_per_dataset_eval_results(
                     "score": concat_generator_outputs["rewards"][i],
                     "stop_reason": concat_generator_outputs.get("stop_reasons", [None] * len(input_prompts))[i],
                     "env_class": concat_all_envs[i],
-                    "env_extras": concat_env_extras[i],
+                    "env_extras": sanitize_env_extras(concat_env_extras[i]),
                     "data_source": data_source,
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")

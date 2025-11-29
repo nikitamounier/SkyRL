@@ -325,6 +325,41 @@ class HFModelWrapper(nn.Module):
 
         return sequences, attention_mask, action_mask
 
+    def _safe_get_embeddings(self, embedding_layer, input_ids):
+        import torch.distributed as dist
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        # FSDP2 Check: DTensor
+        try:
+            try:
+                from torch.distributed.tensor import DTensor
+            except ImportError:
+                from torch.distributed._tensor import DTensor
+
+            if hasattr(embedding_layer, "weight") and isinstance(embedding_layer.weight, DTensor):
+                full_weight = embedding_layer.weight.full_tensor()
+                return F.embedding(
+                    input_ids,
+                    full_weight,
+                    padding_idx=embedding_layer.padding_idx,
+                    max_norm=embedding_layer.max_norm,
+                    norm_type=embedding_layer.norm_type,
+                    scale_grad_by_freq=embedding_layer.scale_grad_by_freq,
+                    sparse=embedding_layer.sparse,
+                )
+        except ImportError:
+            pass
+
+        # FSDP1 Check: Storage size 0 (Sharded)
+        if hasattr(embedding_layer, "weight") and embedding_layer.weight.storage().size() == 0:
+            # Try gathering params.
+            # We use self.model (the HF model) as the root for summoning.
+            # This will summon all params in self.model.
+            with FSDP.summon_full_params(self.model, writeback=False):
+                return embedding_layer(input_ids)
+
+        return embedding_layer(input_ids)
+
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,
@@ -347,7 +382,7 @@ class HFModelWrapper(nn.Module):
         embedding_layer = self.model.get_input_embeddings()
         if embedding_layer is None:
             raise RuntimeError("Underlying model does not expose input embeddings.")
-        base_embeddings = embedding_layer(input_ids)
+        base_embeddings = self._safe_get_embeddings(embedding_layer, input_ids)
 
         if self.modalities_manager is None or not modalities_metadata:
             return base_embeddings, modalities_metadata
@@ -652,6 +687,43 @@ def _get_critic_model(
                         if base_projections is not None:
                             base_projections[modality_id] = module
 
+        def _safe_get_embeddings(self, embedding_layer, input_ids):
+            import torch.distributed as dist
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            # FSDP2 Check: DTensor
+            try:
+                try:
+                    from torch.distributed.tensor import DTensor
+                except ImportError:
+                    from torch.distributed._tensor import DTensor
+
+                if hasattr(embedding_layer, "weight") and isinstance(embedding_layer.weight, DTensor):
+                    full_weight = embedding_layer.weight.full_tensor()
+                    return F.embedding(
+                        input_ids,
+                        full_weight,
+                        padding_idx=embedding_layer.padding_idx,
+                        max_norm=embedding_layer.max_norm,
+                        norm_type=embedding_layer.norm_type,
+                        scale_grad_by_freq=embedding_layer.scale_grad_by_freq,
+                        sparse=embedding_layer.sparse,
+                    )
+            except ImportError:
+                pass
+
+            # FSDP1 Check: Storage size 0 (Sharded)
+            if hasattr(embedding_layer, "weight") and embedding_layer.weight.storage().size() == 0:
+                # Try gathering params.
+                # We use self (the model) as the root for summoning if it's wrapped,
+                # but here self is the inner model.
+                # However, if we call summon_full_params on self, it will summon sub-FSDP modules.
+                # This handles the case where embeddings are in an auto-wrapped sub-FSDP unit.
+                with FSDP.summon_full_params(self, writeback=False):
+                    return embedding_layer(input_ids)
+
+            return embedding_layer(input_ids)
+
         def prepare_inputs_embeds(
             self,
             input_ids: torch.LongTensor,
@@ -662,7 +734,7 @@ def _get_critic_model(
             embedding_layer = self.get_input_embeddings()
             if embedding_layer is None:
                 raise RuntimeError("Underlying model does not expose input embeddings.")
-            base_embeddings = embedding_layer(input_ids)
+            base_embeddings = self._safe_get_embeddings(embedding_layer, input_ids)
 
             if self.modalities_manager is None or not modalities_metadata:
                 return base_embeddings, modalities_metadata
