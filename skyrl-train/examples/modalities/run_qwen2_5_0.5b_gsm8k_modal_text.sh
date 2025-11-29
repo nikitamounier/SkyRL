@@ -21,7 +21,8 @@ CKPT_DIR="${CKPT_DIR:-/root/data/ckpts/gsm8k_0.5b_modal_text_lora_ckpt}"
 NUM_GPUS="${NUM_GPUS:-4}"
 LOGGER="${LOGGER:-wandb}"  # change to "console" to print to stdout
 INFERENCE_BACKEND="vllm"
-MODEL_PATH="Qwen/Qwen3-0.6B"
+# MODEL_PATH can be overridden via environment variable (use local cache path for PromptEmbeddingBuilder)
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 PLACEHOLDER_TOKEN="<|image_pad|>"
 
 uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
@@ -32,23 +33,23 @@ uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
   trainer.placement.colocate_all=true \
   trainer.policy.model.lora.rank=32 \
   trainer.policy.model.lora.alpha=32 \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.num_inference_engines=$NUM_GPUS \
   generator.inference_engine_tensor_parallel_size=1 \
   trainer.epochs=20 \
-  trainer.eval_batch_size=512 \
+  trainer.eval_batch_size=16 \
   trainer.eval_before_train=false \
   trainer.eval_interval=5 \
   trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=512 \
-  trainer.policy_mini_batch_size=256 \
-  trainer.micro_forward_batch_size_per_gpu=64 \
-  trainer.micro_train_batch_size_per_gpu=64 \
+  trainer.train_batch_size=16 \
+  trainer.policy_mini_batch_size=8 \
+  trainer.micro_forward_batch_size_per_gpu=4 \
+  trainer.micro_train_batch_size_per_gpu=4 \
   trainer.ckpt_interval=10 \
   trainer.max_prompt_length=512 \
-  generator.sampling_params.max_generate_length=1024 \
+  generator.sampling_params.max_generate_length=128 \
   trainer.policy.optimizer_config.lr=3.0e-5 \
   trainer.algorithm.use_kl_loss=true \
   generator.backend=$INFERENCE_BACKEND \

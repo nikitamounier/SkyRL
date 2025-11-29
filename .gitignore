@@ -45,3 +45,8 @@ docs/_spelling/
 
 # uv lock files
 uv.lock
+
+*.md
+*.err
+*.out
+
