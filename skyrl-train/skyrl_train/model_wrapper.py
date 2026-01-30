@@ -360,6 +360,38 @@ class HFModelWrapper(nn.Module):
 
         return embedding_layer(input_ids)
 
+    def _mask_modality_tokens(
+        self,
+        input_ids: torch.LongTensor,
+        modalities_metadata: Optional[List[SampleModalityData]],
+    ) -> torch.LongTensor:
+        if modalities_metadata is None:
+            return input_ids
+        if not any(meta.embedding_spans for meta in modalities_metadata):
+            return input_ids
+
+        safe_ids = input_ids.clone()
+        pad_token_id = getattr(self.model.config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.model.config, "eos_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        for sample_idx, meta in enumerate(modalities_metadata):
+            for spans in meta.embedding_spans.values():
+                for span in spans:
+                    start = span.token_start
+                    length = span.token_length
+                    if start < 0 or length <= 0:
+                        continue
+                    end = start + length
+                    if end > safe_ids.size(1):
+                        raise ValueError(
+                            f"Modality span ({start}, {length}) exceeds sequence length {safe_ids.size(1)}."
+                        )
+                    safe_ids[sample_idx, start:end] = pad_token_id
+        return safe_ids
+
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,
@@ -382,7 +414,8 @@ class HFModelWrapper(nn.Module):
         embedding_layer = self.model.get_input_embeddings()
         if embedding_layer is None:
             raise RuntimeError("Underlying model does not expose input embeddings.")
-        base_embeddings = self._safe_get_embeddings(embedding_layer, input_ids)
+        safe_input_ids = self._mask_modality_tokens(input_ids, modalities_metadata)
+        base_embeddings = self._safe_get_embeddings(embedding_layer, safe_input_ids)
 
         if self.modalities_manager is None or not modalities_metadata:
             return base_embeddings, modalities_metadata
@@ -465,10 +498,12 @@ class HFModelWrapper(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(sequences, dtype=torch.long)
 
+        sequences_safe = self._mask_modality_tokens(sequences, modalities_metadata)
+
         metadata_result = modalities_metadata
         if inputs_embeds is None:
             inputs_embeds, metadata_result = self.prepare_inputs_embeds(
-                sequences,
+                sequences_safe,
                 modalities_metadata=modalities_metadata,
                 update_metadata=update_modalities_metadata,
             )
@@ -476,7 +511,7 @@ class HFModelWrapper(nn.Module):
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
 
-        sequences_fwd = sequences
+        sequences_fwd = sequences_safe
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
         inputs_embeds_fwd = inputs_embeds
@@ -724,6 +759,38 @@ def _get_critic_model(
 
             return embedding_layer(input_ids)
 
+        def _mask_modality_tokens(
+            self,
+            input_ids: torch.LongTensor,
+            modalities_metadata: Optional[List[SampleModalityData]],
+        ) -> torch.LongTensor:
+            if modalities_metadata is None:
+                return input_ids
+            if not any(meta.embedding_spans for meta in modalities_metadata):
+                return input_ids
+
+            safe_ids = input_ids.clone()
+            pad_token_id = getattr(self.config, "pad_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = getattr(self.config, "eos_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = 0
+
+            for sample_idx, meta in enumerate(modalities_metadata):
+                for spans in meta.embedding_spans.values():
+                    for span in spans:
+                        start = span.token_start
+                        length = span.token_length
+                        if start < 0 or length <= 0:
+                            continue
+                        end = start + length
+                        if end > safe_ids.size(1):
+                            raise ValueError(
+                                f"Modality span ({start}, {length}) exceeds sequence length {safe_ids.size(1)}."
+                            )
+                        safe_ids[sample_idx, start:end] = pad_token_id
+            return safe_ids
+
         def prepare_inputs_embeds(
             self,
             input_ids: torch.LongTensor,
@@ -734,7 +801,8 @@ def _get_critic_model(
             embedding_layer = self.get_input_embeddings()
             if embedding_layer is None:
                 raise RuntimeError("Underlying model does not expose input embeddings.")
-            base_embeddings = self._safe_get_embeddings(embedding_layer, input_ids)
+            safe_input_ids = self._mask_modality_tokens(input_ids, modalities_metadata)
+            base_embeddings = self._safe_get_embeddings(embedding_layer, safe_input_ids)
 
             if self.modalities_manager is None or not modalities_metadata:
                 return base_embeddings, modalities_metadata
@@ -815,17 +883,19 @@ def _get_critic_model(
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
+            input_ids_safe = self._mask_modality_tokens(input_ids, modalities_metadata)
+
             metadata_result = modalities_metadata
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds, metadata_result = self.prepare_inputs_embeds(
-                    input_ids,
+                    input_ids_safe,
                     modalities_metadata=modalities_metadata,
                     update_metadata=update_modalities_metadata,
                 )
 
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            input_ids_fwd = input_ids
+            input_ids_fwd = input_ids_safe
             position_ids_fwd = position_ids
             attention_mask_fwd = attention_mask
             inputs_embeds_fwd = inputs_embeds

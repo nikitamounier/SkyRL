@@ -1,0 +1,32 @@
+memo_memory:
+  placeholder_token: "<|memory|>"
+  max_placeholder_tokens: 8
+  encoder:
+    target: "skyrl_train.examples.modalities.memo_handlers:MemoMemoryEncoder"
+    kwargs:
+      embedding_dim: 2560
+      num_memories: 8
+      output_dim: 2560
+      num_heads: 8
+      num_layers: 1
+      dropout: 0.1
+      memory_init: "xavier_uniform"
+      # Point to the MeMo repo so the handler can import memo.*
+      memo_repo_root: "/home/nikitamounier/MeMo"
+      # Option A: preload memory embeddings from .npy files (one per user)
+      # memory_embeddings_files:
+      #   - "/path/to/user_1/embeddings/chat_embeddings.npy"
+      #   - "/path/to/user_2/embeddings/chat_embeddings.npy"
+      # Option B: build embeddings from documents (requires sentence-transformers)
+      # memory_documents_dirs:
+      #   - "/path/to/user_1/chats"
+      #   - "/path/to/user_2/chats"
+      # memory_embeddings_files:
+      #   - "/path/to/user_1/embeddings/chat_embeddings.npy"
+      #   - "/path/to/user_2/embeddings/chat_embeddings.npy"
+  projection:
+    target: "skyrl_train.examples.modalities.memo_handlers:IdentityProjection"
+    kwargs: {}
+  trainable:
+    encoder: true
+    projection: false

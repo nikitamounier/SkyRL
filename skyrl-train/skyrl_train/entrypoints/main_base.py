@@ -125,6 +125,20 @@ class BasePPOExp:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
+        # Ensure modality placeholder tokens exist in the tokenizer vocab.
+        if self.cfg.modalities:
+            from skyrl_train.dataset.modalities import normalize_modalities_config
+
+            specs = normalize_modalities_config(self.cfg.modalities)
+            to_add = []
+            for spec in specs.values():
+                token = spec.placeholder_token
+                if tokenizer.convert_tokens_to_ids(token) == -1:
+                    to_add.append(token)
+            if to_add:
+                unique_tokens = list(dict.fromkeys(to_add))
+                tokenizer.add_special_tokens({"additional_special_tokens": unique_tokens})
+                logger.info("Added %d modality placeholder tokens to tokenizer.", len(unique_tokens))
         return tokenizer
 
     def get_train_dataset(self):

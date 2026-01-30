@@ -119,6 +119,14 @@ class PromptEmbeddingBuilder:
         outputs: List[torch.Tensor] = []
         for sample_idx, token_ids in enumerate(prompt_token_ids):
             token_tensor = torch.tensor(token_ids, device=self.device, dtype=torch.long)
+            # Mask out modality placeholder spans before embedding to avoid out-of-range ids
+            for (start, length), _ in modality_replacements.get(sample_idx, []):
+                end = start + length
+                if start < 0 or end > token_tensor.shape[0]:
+                    raise ValueError(
+                        f"Replacement span ({start}, {length}) exceeds prompt length {token_tensor.shape[0]}."
+                    )
+                token_tensor[start:end] = 0
             embeds = self.gather_base_embeddings(token_tensor)
             for (start, length), modality_tensor in modality_replacements.get(sample_idx, []):
                 end = start + length
