@@ -36,3 +36,8 @@ register(
     id="searchcode",
     entry_point="skyrl_gym.envs.searchcode.env:SearchCodeEnv",
 )
+
+register(
+    id="textworld",
+    entry_point="skyrl_gym.envs.textworld.env:TextWorldEnv",
+)

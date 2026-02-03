@@ -41,6 +41,7 @@ trainer:
   policy:
     model:
       path: "Qwen/Qwen2.5-1.5B-Instruct"
+      freeze_base_model: false
       lora:
           rank: 0
           alpha: 16
@@ -214,6 +215,7 @@ generator:
   http_endpoint_host: "127.0.0.1"
   http_endpoint_port: 8000
   max_turns: 1
+  refresh_modalities_each_step: false
 
   # chat template configuration
   chat_template:

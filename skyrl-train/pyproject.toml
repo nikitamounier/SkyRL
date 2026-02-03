@@ -42,6 +42,7 @@ dependencies = [
     "s3fs",
     "fastapi",
     "uvicorn",
+    "textworld",
 ]
 
 [tool.uv]

@@ -10,6 +10,7 @@ are then injected into the prompt via modality placeholders.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import glob
 import importlib.util
 import os
 import sys
@@ -20,7 +21,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger
+from safetensors import safe_open
 from torch.nn.utils.rnn import pad_sequence
+from huggingface_hub import snapshot_download
 
 from skyrl_train.modalities.handlers import ModalityEncoderProtocol, ModalityProjectorProtocol
 from skyrl_train.utils.utils import str_to_torch_dtype
@@ -87,6 +90,77 @@ def _as_tensor(value: Any, *, dtype: Optional[torch.dtype] = None, device: Optio
     if device is not None and tensor.device != device:
         tensor = tensor.to(device=device)
     return tensor
+
+
+def _resolve_model_dir(model_path: str, modality_id: str) -> str:
+    if os.path.isdir(model_path):
+        return model_path
+    try:
+        local_dir = snapshot_download(
+            repo_id=model_path,
+            allow_patterns=("*.safetensors",),
+        )
+        logger.info(
+            "Resolved repo id `%s` to local snapshot `%s` for modality `%s`.",
+            model_path,
+            local_dir,
+            modality_id,
+        )
+        return local_dir
+    except Exception:
+        logger.exception(
+            "Failed to resolve repo id `%s`; falling back to raw path for modality `%s`.",
+            model_path,
+            modality_id,
+        )
+        return model_path
+
+
+def _load_embedding_weight(
+    model_path: str,
+    modality_id: str,
+    embedding_weight_names: Sequence[str],
+) -> torch.Tensor:
+    model_dir = _resolve_model_dir(model_path, modality_id)
+
+    candidate_files: List[str] = []
+    primary = os.path.join(model_dir, "model.safetensors")
+    if os.path.isfile(primary):
+        candidate_files.append(primary)
+    else:
+        shard_pattern = os.path.join(model_dir, "model-*.safetensors")
+        candidate_files.extend(sorted(glob.glob(shard_pattern)))
+
+    if not candidate_files:
+        raise FileNotFoundError(
+            f"No safetensors checkpoint found under `{model_dir}` for modality `{modality_id}`."
+        )
+
+    for path in candidate_files:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for name in embedding_weight_names:
+                if name in handle.keys():
+                    tensor = handle.get_tensor(name)
+                    if tensor.dim() != 2:
+                        logger.warning(
+                            "Ignoring embedding `%s` in `%s` due to unexpected shape %s.",
+                            name,
+                            path,
+                            tuple(tensor.shape),
+                        )
+                        continue
+                    logger.info(
+                        "Loaded embedding weight `%s` for modality `%s` from `%s` (shape=%s).",
+                        name,
+                        modality_id,
+                        path,
+                        tuple(tensor.shape),
+                    )
+                    return tensor
+
+    raise RuntimeError(
+        f"Could not find embedding weights {embedding_weight_names} in `{model_dir}` for modality `{modality_id}`."
+    )
 
 
 @dataclass
@@ -367,6 +441,140 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         return outputs
 
 
+class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
+    """Memory encoder that accepts token ids and embeds them with frozen LLM embeddings."""
+
+    DEFAULT_EMBEDDING_NAMES = (
+        "model.embed_tokens.weight",
+        "model.wte.weight",
+    )
+
+    def __init__(
+        self,
+        modality_id: str,
+        role: str,
+        *,
+        model_path: str,
+        embedding_dim: int,
+        num_memories: int,
+        output_dim: int,
+        num_heads: int = 8,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        memory_init: str = "xavier_uniform",
+        embedding_weight_names: Optional[Sequence[str]] = None,
+        max_doc_tokens: int = 256,
+        device: Optional[str] = None,
+        dtype: Optional[str] = None,
+        memo_repo_root: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_prefix: str = "memory.",
+        **_: Any,
+    ) -> None:
+        super().__init__()
+        self.modality_id = modality_id
+        self.role = role
+        self.max_doc_tokens = int(max_doc_tokens)
+
+        Memory = _import_memo_memory(memo_repo_root)
+        self.memory = Memory(
+            embedding_dim=embedding_dim,
+            num_memories=num_memories,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+            memory_init=memory_init,
+        )
+
+        embedding_weight_names = list(embedding_weight_names or self.DEFAULT_EMBEDDING_NAMES)
+        embedding_weight = _load_embedding_weight(model_path, modality_id, embedding_weight_names)
+        if embedding_weight.shape[1] != embedding_dim:
+            raise ValueError(
+                f"Embedding dim mismatch for `{modality_id}`: weight dim {embedding_weight.shape[1]} "
+                f"!= expected {embedding_dim}."
+            )
+
+        self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
+
+        self._target_device = torch.device(device) if device else None
+        self._target_dtype = str_to_torch_dtype(dtype) if dtype else None
+        if self._target_device or self._target_dtype:
+            self.to(device=self._target_device, dtype=self._target_dtype)
+
+        if checkpoint_path:
+            self._load_checkpoint(checkpoint_path, prefix=checkpoint_prefix)
+
+    def _load_checkpoint(self, checkpoint_path: str, *, prefix: str) -> None:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = state.get("state_dict", state)
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict.")
+        filtered = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        if not filtered:
+            logger.warning(
+                "No parameters matched prefix '%s' in checkpoint %s; loading full state_dict.",
+                prefix,
+                checkpoint_path,
+            )
+            filtered = state_dict
+        missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
+        if missing:
+            logger.warning("Missing keys when loading memory checkpoint: %s", missing)
+        if unexpected:
+            logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
+
+    def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
+        outputs: List[torch.Tensor] = []
+        device = next(self.memory.parameters(), self.embedding.weight).device
+        dtype = next(self.memory.parameters(), self.embedding.weight).dtype
+
+        for payload in payloads:
+            token_ids = self._resolve_token_ids(payload)
+            if not token_ids:
+                outputs.append(self._empty_memory(device=device, dtype=dtype))
+                continue
+
+            token_ids = token_ids[: self.max_doc_tokens]
+            token_tensor = torch.tensor(token_ids, dtype=torch.long, device=device)
+            embeddings = self.embedding(token_tensor)
+            if embeddings.dim() == 2:
+                embeddings = embeddings.unsqueeze(0)
+
+            memory_embeddings, _ = self.memory(embeddings, padding_mask=None)
+            outputs.append(memory_embeddings.squeeze(0).to(dtype=dtype))
+
+        return outputs
+
+    def _resolve_token_ids(self, payload: Any) -> List[int]:
+        if payload is None:
+            return []
+        if isinstance(payload, dict):
+            for key in ("token_ids", "input_ids", "tokens"):
+                if key in payload:
+                    return self._coerce_token_ids(payload[key])
+        return self._coerce_token_ids(payload)
+
+    def _coerce_token_ids(self, value: Any) -> List[int]:
+        if value is None:
+            return []
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().tolist()
+        if isinstance(value, (list, tuple)):
+            return [int(v) for v in value]
+        raise TypeError(
+            f"Modality `{self.modality_id}` expected token id list, got {type(value).__name__}."
+        )
+
+    def _empty_memory(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.zeros(
+            self.memory.num_memories,
+            self.memory.output_dim,
+            device=device,
+            dtype=dtype,
+        )
+
+
 class IdentityProjection(nn.Module, ModalityProjectorProtocol):
     """Pass-through projection for memory embeddings."""
 
@@ -412,6 +620,7 @@ class LinearProjection(nn.Module, ModalityProjectorProtocol):
 __all__ = [
     "MemoryEmbeddingsBank",
     "MemoMemoryEncoder",
+    "MemoTokenMemoryEncoder",
     "IdentityProjection",
     "LinearProjection",
 ]

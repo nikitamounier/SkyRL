@@ -14,3 +14,11 @@ search:
   search_url: "http://127.0.0.1:8000/retrieve"
   topk: 3
   timeout: 30
+
+textworld:
+  tokenizer_path: ""  # required; set to the base model path for tokenization
+  max_turns: 50
+  memory_window: 5
+  max_memory_docs: 4
+  max_doc_tokens: 256
+  memory_modality_id: "memo_memory"

@@ -78,6 +78,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 use_sample_packing=self.cfg.trainer.use_sample_packing,
                 use_torch_compile=self.cfg.trainer.policy.use_torch_compile,
                 modalities_config=self.cfg.trainer.modalities,
+                freeze_base_model=self.cfg.trainer.policy.model.get("freeze_base_model", False),
             )
             # in-place patch
             self._seq_parallel_monkey_patch(model=wrapped_model.model)

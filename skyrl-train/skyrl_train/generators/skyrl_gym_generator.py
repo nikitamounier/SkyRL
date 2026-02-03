@@ -80,6 +80,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         self.max_turns = generator_cfg.max_turns
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn
+        self.refresh_modalities_each_step = getattr(generator_cfg, "refresh_modalities_each_step", False)
         # optionally use custom chat template to get loss masks (i.e. for Qwen3)
         self.custom_chat_template = get_custom_chat_template(generator_cfg.chat_template)
         # get generation prompt ids for the tokenizer if needed
@@ -279,6 +280,13 @@ class SkyRLGymGenerator(GeneratorInterface):
                 stop_reason = "length"
                 break
 
+            if self.refresh_modalities_each_step and single_modalities_batches is not None:
+                single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
+                if single_modalities_batches:
+                    single_modalities_metadata = [self._collect_modalities_metadata(env_extras)]
+                else:
+                    single_modalities_metadata = None
+
             # 1. Generate output
             if retokenize_chat_history:
                 engine_input = InferenceEngineInput(
@@ -323,6 +331,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             new_obs = env_step_output["observations"]
             step_reward: float = env_step_output["reward"]
             done = env_step_output["done"]
+            if isinstance(env_step_output.get("metadata"), dict) and "modalities" in env_step_output["metadata"]:
+                env_extras["modalities"] = env_step_output["metadata"]["modalities"]
 
             if env_step_output.get("postprocessed_action", None) is not None:
                 # TODO(Charlie): come back to this, we should deprecate postprocessed action

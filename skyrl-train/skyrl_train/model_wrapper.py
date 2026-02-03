@@ -73,6 +73,7 @@ class HFModelWrapper(nn.Module):
         use_sample_packing: bool = False,
         use_torch_compile: bool = False,
         modalities_config: Optional[dict] = None,
+        freeze_base_model: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -224,6 +225,11 @@ class HFModelWrapper(nn.Module):
                     if self._base_modality_projection_modules is not None:
                         self._base_modality_projection_modules[modality_id] = module
 
+        if freeze_base_model:
+            self._freeze_base_parameters()
+
+        self._freeze_base_model = freeze_base_model
+
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
         self.chunked_entropy_from_logits_fn = (
@@ -231,6 +237,27 @@ class HFModelWrapper(nn.Module):
             if use_torch_compile
             else chunked_entropy_from_logits
         )
+
+    def _freeze_base_parameters(self) -> None:
+        """Freeze non-modality parameters on the underlying HF model."""
+        modality_prefixes = ("_skyrl_modality_encoders.", "_skyrl_modality_projections.")
+
+        for name, param in self.model.named_parameters():
+            if name.startswith(modality_prefixes):
+                continue
+            param.requires_grad = False
+
+        # Re-apply modality trainability based on specs
+        if self.modalities_manager is not None:
+            for modality_id, role, module in self.modalities_manager.iter_handler_modules():
+                if not isinstance(module, nn.Module):
+                    continue
+                spec = self.modalities_manager._specs.get(modality_id)
+                if spec is None:
+                    continue
+                trainable = spec.trainable.encoder if role == "encoder" else spec.trainable.projection
+                for param in module.parameters():
+                    param.requires_grad = trainable
 
     @torch.no_grad()
     def generate(
