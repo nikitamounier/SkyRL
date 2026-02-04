@@ -52,20 +52,38 @@ class PromptEmbeddingBuilder:
             )
 
     def _load_embedding_from_checkpoint(self, model_path: str) -> Optional[torch.Tensor]:
-        candidate_files = []
-        primary = os.path.join(model_path, "model.safetensors")
-        if os.path.isfile(primary):
-            candidate_files.append(primary)
-        else:
-            shard_pattern = os.path.join(model_path, "model-*.safetensors")
-            shard_files = sorted(glob.glob(shard_pattern))
-            candidate_files.extend(shard_files)
+        def _find_safetensors(search_dir: str) -> List[str]:
+            candidates: List[str] = []
+            primary = os.path.join(search_dir, "model.safetensors")
+            if os.path.isfile(primary):
+                candidates.append(primary)
+            else:
+                shard_pattern = os.path.join(search_dir, "model-*.safetensors")
+                candidates.extend(sorted(glob.glob(shard_pattern)))
+            return candidates
+
+        candidate_files: List[str] = []
+        if os.path.isdir(model_path):
+            candidate_files = _find_safetensors(model_path)
+
+        resolved_dir: Optional[str] = None
+        if not candidate_files:
+            try:
+                from huggingface_hub import snapshot_download
+
+                resolved_dir = snapshot_download(
+                    repo_id=model_path,
+                    allow_patterns=("*.safetensors",),
+                )
+                candidate_files = _find_safetensors(resolved_dir)
+            except Exception:
+                resolved_dir = None
 
         if not candidate_files:
             logger.warning(
                 "PromptEmbeddingBuilder could not find safetensors checkpoint under `%s`. "
                 "Expected `model.safetensors` or sharded files.",
-                model_path,
+                resolved_dir or model_path,
             )
             return None
 

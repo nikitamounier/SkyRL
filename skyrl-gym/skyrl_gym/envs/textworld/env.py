@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import threading
 from typing import Any, Dict, List, Optional
 
 from omegaconf import DictConfig
@@ -88,6 +89,9 @@ class _IncrementalMemory:
         return "\n".join(lines).strip()
 
 
+_TEXTWORLD_START_LOCK = threading.Lock()
+
+
 class TextWorldEnv(BaseTextEnv):
     """
     TextWorld environment with incremental memory document creation.
@@ -149,13 +153,9 @@ class TextWorldEnv(BaseTextEnv):
                 raise ImportError(
                     "TextWorld is not installed. Install it to use TextWorldEnv."
                 ) from exc
-            if self.game_file.endswith((".z1", ".z2", ".z3", ".z4", ".z5", ".z6", ".z7", ".z8")):
-                from textworld.envs.zmachine.jericho import JerichoEnv  # type: ignore
-
-                env = JerichoEnv()
-                env.load(self.game_file)
-                self._env = env
-            else:
+            # Use textworld.start so Inform7 wrappers are applied when available.
+            # textworld.logic uses a global parser that is not thread-safe; guard startup.
+            with _TEXTWORLD_START_LOCK:
                 self._env = textworld.start(self.game_file)
         return self._env
 

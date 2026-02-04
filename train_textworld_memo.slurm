@@ -25,6 +25,10 @@ LOGGER="${LOGGER:-wandb}"
 
 # Use repo id by default; override with a local snapshot path if desired.
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
+LOCAL_SNAPSHOT_PATH="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"
+if [[ "$MODEL_PATH" == "Qwen/Qwen3-4B-Instruct-2507" && -d "$LOCAL_SNAPSHOT_PATH" ]]; then
+    MODEL_PATH="$LOCAL_SNAPSHOT_PATH"
+fi
 MEMORY_DIM="${MEMORY_DIM:-2560}"
 
 if [ ! -d "skyrl-train/skyrl-gym" ] && [ -d "skyrl-gym" ]; then

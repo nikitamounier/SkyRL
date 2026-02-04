@@ -28,6 +28,54 @@ from huggingface_hub import snapshot_download
 from skyrl_train.modalities.handlers import ModalityEncoderProtocol, ModalityProjectorProtocol
 from skyrl_train.utils.utils import str_to_torch_dtype
 
+try:  # DTensor is optional depending on torch build
+    from torch.distributed.tensor import DTensor, Replicate  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    try:  # older API
+        from torch.distributed._tensor import DTensor, Replicate  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        DTensor = None  # type: ignore
+        Replicate = None  # type: ignore
+
+
+def _is_dtensor(value: torch.Tensor) -> bool:
+    return DTensor is not None and isinstance(value, DTensor)
+
+
+def _dtensor_mesh(value: torch.Tensor):
+    if not _is_dtensor(value):
+        return None
+    mesh = getattr(value, "device_mesh", None) or getattr(value, "mesh", None)
+    spec = getattr(value, "_spec", None)
+    if mesh is None and spec is not None:
+        mesh = getattr(spec, "mesh", None)
+    return mesh
+
+
+def _dtensor_to_local(value: torch.Tensor) -> torch.Tensor:
+    if not _is_dtensor(value):
+        return value
+    if hasattr(value, "to_local"):
+        return value.to_local()
+    if hasattr(value, "local_tensor"):
+        return value.local_tensor()
+    return value
+
+
+def _to_dtensor_replicated(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if not _is_dtensor(ref):
+        return tensor
+    mesh = _dtensor_mesh(ref)
+    if mesh is None or Replicate is None:
+        return tensor
+    # Use run_check=False to avoid collective syncs for small dummy inputs.
+    return DTensor.from_local(tensor, mesh, [Replicate()], run_check=False)  # type: ignore[arg-type]
+
+
+def _local_device_dtype(ref: torch.Tensor) -> tuple[torch.device, torch.dtype]:
+    local = _dtensor_to_local(ref)
+    return local.device, local.dtype
+
 
 def _maybe_add_memo_repo(memo_repo_root: Optional[str]) -> None:
     if importlib.util.find_spec("memo") is not None:
@@ -409,18 +457,24 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         outputs: List[torch.Tensor] = []
         param = next(self.memory.parameters(), None)
-        device = param.device if param is not None else None
-        dtype = param.dtype if param is not None else None
+        ref_tensor = param if param is not None else None
+        if ref_tensor is not None:
+            device, dtype = _local_device_dtype(ref_tensor)
+        else:
+            device, dtype = None, None
 
         for payload in payloads:
             resolved = self._resolve_payload(payload)
             if resolved.precomputed:
                 memory_embeddings = self._ensure_2d(resolved.inputs_embeds, name="memory_embeddings")
+                memory_embeddings = _dtensor_to_local(memory_embeddings)
                 outputs.append(memory_embeddings)
                 continue
 
             inputs_embeds = _as_tensor(resolved.inputs_embeds, dtype=dtype, device=device)
             inputs_embeds = self._ensure_2d(inputs_embeds, name="inputs_embeds").unsqueeze(0)
+            if ref_tensor is not None and _is_dtensor(ref_tensor):
+                inputs_embeds = _to_dtensor_replicated(inputs_embeds, ref_tensor)
 
             padding_mask = resolved.padding_mask
             if padding_mask is not None:
@@ -436,6 +490,7 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
                 padding_mask = padding_mask.to(dtype=torch.bool)
 
             memory_embeddings, _ = self.memory(inputs_embeds, padding_mask)
+            memory_embeddings = _dtensor_to_local(memory_embeddings)
             outputs.append(self._ensure_2d(memory_embeddings, name="memory_embeddings"))
 
         return outputs
@@ -529,13 +584,14 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
 
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         outputs: List[torch.Tensor] = []
-        device = next(self.memory.parameters(), self.embedding.weight).device
-        dtype = next(self.memory.parameters(), self.embedding.weight).dtype
+        ref_param = next(self.memory.parameters(), None)
+        ref_tensor = ref_param if ref_param is not None else self.embedding.weight
+        device, dtype = _local_device_dtype(ref_tensor)
 
         for payload in payloads:
             token_ids = self._resolve_token_ids(payload)
             if not token_ids:
-                outputs.append(self._empty_memory(device=device, dtype=dtype))
+                outputs.append(self._empty_memory(ref_tensor=ref_tensor, device=device, dtype=dtype))
                 continue
 
             token_ids = token_ids[: self.max_doc_tokens]
@@ -544,7 +600,11 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             if embeddings.dim() == 2:
                 embeddings = embeddings.unsqueeze(0)
 
+            if _is_dtensor(ref_tensor):
+                embeddings = _to_dtensor_replicated(embeddings, ref_tensor)
+
             memory_embeddings, _ = self.memory(embeddings, padding_mask=None)
+            memory_embeddings = _dtensor_to_local(memory_embeddings)
             outputs.append(memory_embeddings.squeeze(0).to(dtype=dtype))
 
         return outputs
@@ -569,17 +629,20 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             f"Modality `{self.modality_id}` expected token id list, got {type(value).__name__}."
         )
 
-    def _empty_memory(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # Use a dummy token so gradients flow into the memory module even when no tokens are available.
-        dummy = torch.zeros(
-            1,
-            1,
-            self.memory.embedding_dim,
-            device=device,
-            dtype=dtype,
-        )
-        memory_embeddings, _ = self.memory(dummy, padding_mask=None)
-        return memory_embeddings.squeeze(0)
+    def _empty_memory(
+        self,
+        *,
+        ref_tensor: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # No document tokens available: use the memory queries + projection path
+        # to keep gradients flowing without invoking attention.
+        memory_embeddings = self.memory.layer_norm(self.memory.memory_queries)
+        memory_embeddings = self.memory.memory_projection(memory_embeddings)
+        memory_embeddings = _dtensor_to_local(memory_embeddings)
+        memory_embeddings = memory_embeddings.squeeze(0)
+        return memory_embeddings.to(device=device, dtype=dtype)
 
 
 class IdentityProjection(nn.Module, ModalityProjectorProtocol):
