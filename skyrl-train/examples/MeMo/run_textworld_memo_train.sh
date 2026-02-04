@@ -36,6 +36,7 @@ PLACEHOLDER_TOKEN="${PLACEHOLDER_TOKEN:-<|image_pad|>}"
 MEMORY_DIM="${MEMORY_DIM:-2560}"
 NUM_MEMORIES="${NUM_MEMORIES:-8}"
 MAX_MEMORY_DOCS="${MAX_MEMORY_DOCS:-4}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 
 uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
@@ -71,7 +72,8 @@ uv run --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_base \
   trainer.micro_forward_batch_size_per_gpu=2 \
   trainer.micro_train_batch_size_per_gpu=2 \
   trainer.ckpt_interval=10 \
-  trainer.max_prompt_length=512 \
+  trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
+  generator.max_input_length=$MAX_PROMPT_LENGTH \
   trainer.policy.optimizer_config.lr=5.0e-5 \
   generator.backend=$INFERENCE_BACKEND \
   generator.run_engines_locally=true \

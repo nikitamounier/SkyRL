@@ -495,6 +495,9 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
                 f"!= expected {embedding_dim}."
             )
 
+        target_dtype = next(self.memory.parameters(), embedding_weight).dtype
+        if embedding_weight.dtype != target_dtype:
+            embedding_weight = embedding_weight.to(dtype=target_dtype)
         self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
 
         self._target_device = torch.device(device) if device else None
@@ -567,12 +570,16 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         )
 
     def _empty_memory(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return torch.zeros(
-            self.memory.num_memories,
-            self.memory.output_dim,
+        # Use a dummy token so gradients flow into the memory module even when no tokens are available.
+        dummy = torch.zeros(
+            1,
+            1,
+            self.memory.embedding_dim,
             device=device,
             dtype=dtype,
         )
+        memory_embeddings, _ = self.memory(dummy, padding_mask=None)
+        return memory_embeddings.squeeze(0)
 
 
 class IdentityProjection(nn.Module, ModalityProjectorProtocol):

@@ -148,10 +148,18 @@ class MultimodalPromptProcessor:
                 modality_id,
                 occurrences,
             )
-        result = content
-        for reserved_length in reserved_tokens:
-            replacement = placeholder_token * reserved_length
-            result = result.replace(placeholder_token, replacement, 1)
+
+        if occurrences == 0:
+            return content
+
+        parts = content.split(placeholder_token)
+        result = parts[0]
+        for idx in range(occurrences):
+            if idx < len(reserved_tokens):
+                replacement = placeholder_token * reserved_tokens[idx]
+            else:
+                replacement = placeholder_token
+            result += replacement + parts[idx + 1]
         return result
 
 

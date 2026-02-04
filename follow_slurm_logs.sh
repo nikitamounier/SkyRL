@@ -9,6 +9,7 @@ set -euo pipefail
 
 PREFIX="${1:-}"
 JOB_ID="${2:-}"
+MAX_WAIT="${MAX_WAIT:-1800}" # seconds; set to 0 to wait indefinitely
 
 if [[ -z "$PREFIX" ]]; then
   echo "Usage: $0 <prefix> [job_id]"
@@ -25,9 +26,25 @@ fi
 
 wait_for_file() {
   local file="$1"
-  local max_wait="${2:-300}"
+  local max_wait="${2:-$MAX_WAIT}"
   local waited=0
-  while [[ ! -f "$file" && $waited -lt $max_wait ]]; do
+  local last_status=""
+  while [[ ! -f "$file" ]]; do
+    if [[ "$max_wait" -gt 0 && $waited -ge $max_wait ]]; then
+      return 1
+    fi
+    if [[ -n "$JOB_ID" ]] && command -v squeue >/dev/null 2>&1; then
+      local status
+      status="$(squeue -j "$JOB_ID" -h -o "%T" 2>/dev/null || true)"
+      if [[ -n "$status" && "$status" != "$last_status" ]]; then
+        echo "Waiting for $file (job $JOB_ID status: $status)..."
+        last_status="$status"
+      fi
+      if [[ -z "$status" && "$max_wait" -gt 0 && $waited -ge 10 ]]; then
+        # Job no longer in queue and no log file yet.
+        return 1
+      fi
+    fi
     sleep 1
     waited=$((waited + 1))
   done

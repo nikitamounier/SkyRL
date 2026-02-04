@@ -389,6 +389,10 @@ class SkyRLGymGenerator(GeneratorInterface):
         else:
             response_ids = input_ids[initial_prompt_length:]
             per_step_rewards = [(reward, idx - initial_prompt_length) for reward, idx in per_step_rewards]
+        if not response_ids:
+            logger.warning("Empty response detected; inserting eos token with zero loss mask.")
+            response_ids = [self.tokenizer.eos_token_id]
+            loss_mask = [0]
         assert len(loss_mask) == len(response_ids), "loss_mask and response_ids should have the same length"
 
         appended_eos_token = False
@@ -403,12 +407,14 @@ class SkyRLGymGenerator(GeneratorInterface):
             # TODO(Charlie): Currently, the possible response truncation will not affect the reward
             # in the if branch, but some final rewards may be lost in the else branch. Fix this
             # when we support turn-level rewards for the `retokenize_chat_history` codepath.
-            reward_out = per_step_rewards[-1][0]
+            reward_out = per_step_rewards[-1][0] if per_step_rewards else 0.0
         else:
             # Build token-level rewards placed at assistant turn boundaries
             token_level_rewards: List[float] = [0.0] * len(response_ids)
             for i, (step_reward, idx) in enumerate(per_step_rewards):
                 assert step_reward is not None
+                if idx is None or idx < 0:
+                    continue
                 if idx >= len(response_ids):
                     break
                 if appended_eos_token and i == len(per_step_rewards) - 1:

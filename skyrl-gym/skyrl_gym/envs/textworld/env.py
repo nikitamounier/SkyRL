@@ -244,10 +244,16 @@ class TextWorldEnv(BaseTextEnv):
         self._game_state = None
 
     def get_metrics(self) -> Dict[str, Any]:
+        score = 0
+        if self._game_state is not None:
+            raw_score = getattr(self._game_state, "score", 0)
+            if raw_score is None:
+                raw_score = 0
+            score = int(raw_score)
         return {
             "steps": self.turns,
             "won": bool(getattr(self._game_state, "won", False)) if self._game_state is not None else False,
-            "score": int(getattr(self._game_state, "score", 0)) if self._game_state is not None else 0,
+            "score": score,
         }
 
 

@@ -525,6 +525,13 @@ class HFModelWrapper(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(sequences, dtype=torch.long)
 
+        modalities_metadata = self._shift_modalities_metadata_for_padding(
+            sequences=sequences,
+            attention_mask=attention_mask,
+            num_actions=num_actions,
+            modalities_metadata=modalities_metadata,
+        )
+
         sequences_safe = self._mask_modality_tokens(sequences, modalities_metadata)
 
         metadata_result = modalities_metadata
@@ -666,6 +673,56 @@ class HFModelWrapper(nn.Module):
         else:
             return action_log_probs
 
+    def _shift_modalities_metadata_for_padding(
+        self,
+        *,
+        sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_actions: Union[int, list[int]],
+        modalities_metadata: Optional[List[SampleModalityData]],
+    ) -> Optional[List[SampleModalityData]]:
+        """Shift modality embedding spans to account for left-padding in training batches."""
+        if modalities_metadata is None:
+            return None
+
+        if not isinstance(num_actions, int):
+            return modalities_metadata
+
+        if num_actions <= 0:
+            return modalities_metadata
+
+        seq_len = sequences.size(1)
+        max_prompt_len = seq_len - num_actions
+        if max_prompt_len <= 0:
+            return modalities_metadata
+
+        response_mask = attention_mask[:, -num_actions:]
+        response_lengths = response_mask.sum(dim=1)
+        prompt_lengths = attention_mask.sum(dim=1) - response_lengths
+        pad_lengths = max_prompt_len - prompt_lengths
+
+        if torch.all(pad_lengths == 0):
+            return modalities_metadata
+
+        shifted_metadata: List[SampleModalityData] = []
+        for idx, meta in enumerate(modalities_metadata):
+            pad_len = int(pad_lengths[idx].item())
+            if pad_len <= 0 or not meta.embedding_spans:
+                shifted_metadata.append(meta)
+                continue
+
+            if hasattr(meta, "clone"):
+                meta = meta.clone()
+            else:
+                meta = deepcopy(meta)
+
+            for spans in meta.embedding_spans.values():
+                for span in spans:
+                    span.token_start += pad_len
+
+            shifted_metadata.append(meta)
+
+        return shifted_metadata
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={"use_reentrant": False}):
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
