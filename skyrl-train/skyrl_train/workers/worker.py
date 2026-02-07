@@ -742,9 +742,43 @@ class PolicyWorkerBase(Worker):
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
         rollout_action_logprobs = experience.rollout_logprobs
+        import sys
         modalities_metadata = None
+        # Check for memory documents at sample level
+        # Need to determine if batch has consistent gradient states for backward pass
+        has_any_memory_docs = False
+        all_samples_have_memory_docs = True
+        samples_with_memory = 0
+        samples_without_memory = 0
+
         if experience.metadata is not None:
             modalities_metadata = experience.metadata.get("modalities_metadata")
+            if modalities_metadata is not None:
+                # Scan ALL samples to determine batch composition
+                for idx, metadata in enumerate(modalities_metadata):
+                    sample_has_docs = False
+                    if metadata is not None and hasattr(metadata, 'payloads'):
+                        # Check if any modality has non-empty payloads
+                        for modality_id, payloads in metadata.payloads.items():
+                            if payloads and any(p for p in payloads if p):
+                                sample_has_docs = True
+                                has_any_memory_docs = True
+                                break
+
+                    if sample_has_docs:
+                        samples_with_memory += 1
+                    else:
+                        samples_without_memory += 1
+                        all_samples_have_memory_docs = False
+
+        # Log batch composition for diagnostics
+        sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[BATCH CHECK] Samples with memory: {samples_with_memory}\n")
+        sys.stderr.write(f"[BATCH CHECK] Samples without memory: {samples_without_memory}\n")
+        sys.stderr.write(f"[BATCH CHECK] has_any_memory_docs: {has_any_memory_docs}\n")
+        sys.stderr.write(f"[BATCH CHECK] all_consistent: {all_samples_have_memory_docs}\n")
+        sys.stderr.write(f"{'='*80}\n")
+        sys.stderr.flush()
         supports_modalities = self._get_modalities_capable_module() is not None
         supports_modalities = self._get_modalities_capable_module() is not None
 
@@ -795,6 +829,57 @@ class PolicyWorkerBase(Worker):
 
         loss = policy_loss + kl_loss * self.cfg.trainer.algorithm.kl_loss_coef
         loss = loss / accumulation_steps
+
+        # CRITICAL: Skip backward pass if batch has inconsistent gradient states
+        # This prevents gradient errors from mixed grad/no-grad tensors
+        # Skip if: (1) modalities_metadata is None, OR
+        #          (2) no samples have memory docs, OR
+        #          (3) mixed batch (some have docs, some don't)
+        should_skip = (
+            (modalities_metadata is None) or
+            (not has_any_memory_docs) or
+            (not all_samples_have_memory_docs)  # NEW: Skip mixed batches
+        )
+
+        if should_skip:
+            sys.stderr.write(f"\n{'='*80}\n")
+            sys.stderr.write(f"[SKIP BACKWARD] ⚠️  SKIPPING BACKWARD PASS\n")
+            if modalities_metadata is None:
+                sys.stderr.write(f"[SKIP BACKWARD]   Reason: No modalities metadata\n")
+            elif not has_any_memory_docs:
+                sys.stderr.write(f"[SKIP BACKWARD]   Reason: No samples have memory docs\n")
+                sys.stderr.write(f"[SKIP BACKWARD]   (Expected for early episode turns before memory_window threshold)\n")
+            elif not all_samples_have_memory_docs:
+                sys.stderr.write(f"[SKIP BACKWARD]   Reason: Mixed batch - prevents gradient errors\n")
+                sys.stderr.write(f"[SKIP BACKWARD]   ({samples_with_memory} with docs, {samples_without_memory} without)\n")
+                sys.stderr.write(f"[SKIP BACKWARD]   Cannot safely backward through mixed grad/no-grad states\n")
+            sys.stderr.write(f"{'='*80}\n")
+            sys.stderr.flush()
+
+            # Return dummy status to continue training loop
+            # Handle num_actions as either tensor or scalar
+            if isinstance(num_actions, torch.Tensor):
+                avg_response_length = num_actions.float().mean().item()
+            else:
+                avg_response_length = float(num_actions)
+
+            return {
+                "policy_loss": 0.0,
+                "response_length": avg_response_length,
+                "policy_lr": self.scheduler.get_last_lr()[0],
+                "policy_entropy": 0.0,
+                "reward": 0.0,
+                "skipped_no_memory": 1.0,
+                "samples_with_memory": samples_with_memory,
+                "samples_without_memory": samples_without_memory,
+            }
+
+        sys.stderr.write(f"\n{'='*80}\n")
+        sys.stderr.write(f"[BACKWARD] ✓ PROCEEDING WITH BACKWARD PASS - MEMORY DOCUMENTS PRESENT\n")
+        sys.stderr.write(f"[BACKWARD] has_any_memory_docs={has_any_memory_docs}\n")
+        sys.stderr.write(f"{'='*80}\n")
+        sys.stderr.flush()
+
         self.strategy.backward(loss, self.model, self.optimizer)
 
         grad_norm = None

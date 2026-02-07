@@ -338,6 +338,11 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             memory_init=memory_init,
         )
 
+        # Store for validation
+        self.num_memories = num_memories
+        self.embedding_dim = embedding_dim
+        self.output_dim = output_dim
+
         self._target_device = torch.device(device) if device else None
         self._target_dtype = str_to_torch_dtype(dtype) if dtype else None
         if self._target_device or self._target_dtype:
@@ -542,6 +547,11 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             memory_init=memory_init,
         )
 
+        # Store for validation (accessible via self.memory too, but keep here for convenience)
+        self.num_memories = num_memories
+        self.embedding_dim = embedding_dim
+        self.output_dim = output_dim
+
         embedding_weight_names = list(embedding_weight_names or self.DEFAULT_EMBEDDING_NAMES)
         embedding_weight = _load_embedding_weight(model_path, modality_id, embedding_weight_names)
         if embedding_weight.shape[1] != embedding_dim:
@@ -553,7 +563,10 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         target_dtype = next(self.memory.parameters(), embedding_weight).dtype
         if embedding_weight.dtype != target_dtype:
             embedding_weight = embedding_weight.to(dtype=target_dtype)
-        self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
+        # Store embedding weight as a buffer (not a parameter) to prevent FSDP from managing it
+        # Buffers are not trainable and won't be included in optimizer or FSDP sharding
+        self.register_buffer('embedding_weight', embedding_weight, persistent=True)
+        self.embedding_dim_size = embedding_weight.shape[1]
 
         self._target_device = torch.device(device) if device else None
         self._target_dtype = str_to_torch_dtype(dtype) if dtype else None
@@ -585,28 +598,110 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         outputs: List[torch.Tensor] = []
         ref_param = next(self.memory.parameters(), None)
-        ref_tensor = ref_param if ref_param is not None else self.embedding.weight
+        ref_tensor = ref_param if ref_param is not None else self.embedding_weight
         device, dtype = _local_device_dtype(ref_tensor)
 
-        for payload in payloads:
+        # Access config values safely (FSDP wrapping may change attribute access)
+        # Try to get from instance attributes, fallback to Memory module config
+        embedding_dim = getattr(self, 'embedding_dim', getattr(self.memory, 'embedding_dim', 2560))
+        num_memories = getattr(self, 'num_memories', getattr(self.memory, 'num_memories', 8))
+        output_dim = getattr(self, 'output_dim', getattr(self.memory, 'output_dim', 2560))
+
+        # DEBUG: Check memory params have requires_grad
+        memory_params_trainable = all(p.requires_grad for p in self.memory.parameters())
+        if not memory_params_trainable:
+            logger.error(f"[GRAD DEBUG] Memory params DON'T have requires_grad=True!")
+
+        samples_with_memory = 0
+        samples_without_memory = 0
+
+        for idx, payload in enumerate(payloads):
             token_ids = self._resolve_token_ids(payload)
             if not token_ids:
-                outputs.append(self._empty_memory(ref_tensor=ref_tensor, device=device, dtype=dtype))
+                samples_without_memory += 1
+                print(f"[MeMo ENCODER] Sample {idx}: NO memory documents (using _empty_memory)")
+                empty_result = self._empty_memory(ref_tensor=ref_tensor, device=device, dtype=dtype)
+
+                # Check grad_fn
+                # Gradient validation now handled in _empty_memory() itself
+                if empty_result.grad_fn is not None:
+                    logger.info(f"[GRAD DEBUG] Sample {idx}: _empty_memory HAS grad_fn: {type(empty_result.grad_fn).__name__}")
+                else:
+                    # This should never happen after fix - _empty_memory raises RuntimeError
+                    logger.error(f"[GRAD DEBUG] Sample {idx}: _empty_memory has NO grad_fn!")
+
+                outputs.append(empty_result)
                 continue
 
+            samples_with_memory += 1
+            print(f"[MeMo ENCODER] Sample {idx}: HAS {len(token_ids)} memory tokens")
             token_ids = token_ids[: self.max_doc_tokens]
             token_tensor = torch.tensor(token_ids, dtype=torch.long, device=device)
-            embeddings = self.embedding(token_tensor)
+            # Use functional embedding lookup with buffer (not nn.Embedding module)
+            embeddings = torch.nn.functional.embedding(token_tensor, self.embedding_weight)
             if embeddings.dim() == 2:
                 embeddings = embeddings.unsqueeze(0)
 
-            if _is_dtensor(ref_tensor):
-                embeddings = _to_dtensor_replicated(embeddings, ref_tensor)
+            # Detach FIRST to prevent gradients flowing to frozen LLM embedding
+            embeddings_detached = embeddings.detach()
 
-            memory_embeddings, _ = self.memory(embeddings, padding_mask=None)
-            memory_embeddings = _dtensor_to_local(memory_embeddings)
-            outputs.append(memory_embeddings.squeeze(0).to(dtype=dtype))
+            # Memory module is excluded from FSDP wrapping, so params are regular tensors.
+            # Ensure input is also a regular tensor (not DTensor).
+            if _is_dtensor(embeddings_detached):
+                embeddings_detached = _dtensor_to_local(embeddings_detached)
 
+            # Validate input shape before Memory module
+            logger.info(f"[SHAPE DEBUG] Sample {idx}: Input to Memory module: shape={embeddings_detached.shape}, dtype={embeddings_detached.dtype}")
+
+            # Expected: [1, seq_len, embedding_dim] where seq_len = num document tokens
+            if embeddings_detached.dim() != 3:
+                raise RuntimeError(
+                    f"[MeMo ENCODER] Sample {idx}: Invalid input shape to Memory module! "
+                    f"Expected 3D tensor [1, seq_len, {embedding_dim}], got shape {embeddings_detached.shape}"
+                )
+
+            batch_size, seq_len, embed_dim = embeddings_detached.shape
+            if batch_size != 1:
+                raise RuntimeError(
+                    f"[MeMo ENCODER] Sample {idx}: Expected batch_size=1, got {batch_size}"
+                )
+            if embed_dim != embedding_dim:
+                raise RuntimeError(
+                    f"[MeMo ENCODER] Sample {idx}: Expected embed_dim={embedding_dim}, got {embed_dim}"
+                )
+
+            logger.info(f"[SHAPE DEBUG] Sample {idx}: Input validation passed - processing {seq_len} tokens")
+
+            # Memory module forward pass with gradient enabled
+            with torch.enable_grad():
+                memory_embeddings, _ = self.memory(embeddings_detached, padding_mask=None)
+
+            logger.info(f"[SHAPE DEBUG] Sample {idx}: Memory module output shape={memory_embeddings.shape}")
+
+            # STRICT VALIDATION: Ensure exact number of memory embeddings
+            expected_shape = (1, num_memories, output_dim)
+            if memory_embeddings.shape != expected_shape:
+                raise RuntimeError(
+                    f"[MeMo ENCODER] Sample {idx}: Memory module returned wrong shape! "
+                    f"Expected {expected_shape}, got {memory_embeddings.shape}. "
+                    f"This means the number of memory embeddings ({memory_embeddings.shape[1]}) "
+                    f"does NOT match reserved placeholder tokens ({num_memories})!"
+                )
+
+            # Gradient check
+            if memory_embeddings.grad_fn is not None:
+                logger.info(f"[GRAD DEBUG] Sample {idx}: Memory output HAS grad_fn: {type(memory_embeddings.grad_fn).__name__}")
+            else:
+                logger.error(f"[GRAD DEBUG] Sample {idx}: Memory output has NO grad_fn!")
+
+            # Squeeze to [num_memories, output_dim] = [8, 2560]
+            memory_result = memory_embeddings.squeeze(0).to(dtype=dtype)
+            assert memory_result.shape == (num_memories, output_dim), \
+                f"After squeeze, expected shape ({num_memories}, {output_dim}), got {memory_result.shape}"
+
+            outputs.append(memory_result)
+
+        print(f"\n[MeMo ENCODER SUMMARY] Batch: {samples_with_memory} WITH memory, {samples_without_memory} WITHOUT memory\n")
         return outputs
 
     def _resolve_token_ids(self, payload: Any) -> List[int]:
@@ -636,13 +731,60 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # No document tokens available: use the memory queries + projection path
-        # to keep gradients flowing without invoking attention.
-        memory_embeddings = self.memory.layer_norm(self.memory.memory_queries)
-        memory_embeddings = self.memory.memory_projection(memory_embeddings)
-        memory_embeddings = _dtensor_to_local(memory_embeddings)
-        memory_embeddings = memory_embeddings.squeeze(0)
-        return memory_embeddings.to(device=device, dtype=dtype)
+        """Generate empty memory embeddings when no documents exist.
+
+        This path must maintain gradient flow for the trainable memory module,
+        even when no memory documents are available.
+        """
+
+        # Store original training state to restore after
+        was_training = self.memory.training
+
+        # CRITICAL: Force training mode for gradient computation
+        self.memory.train()
+
+        try:
+            # Use inference_mode(False) + enable_grad() for guaranteed gradient tracking
+            # This overrides any outer no_grad() or inference_mode contexts
+            with torch.inference_mode(False):
+                with torch.enable_grad():
+                    # Clone to ensure we're not operating on a no-grad tensor
+                    mq = self.memory.memory_queries.clone()
+
+                    # Apply transformations
+                    memory_embeddings = self.memory.layer_norm(mq)
+                    memory_embeddings = self.memory.memory_projection(memory_embeddings)
+
+            # Squeeze and convert dtype/device (preserves grad_fn)
+            memory_embeddings = memory_embeddings.squeeze(0)
+            if memory_embeddings.device != device or memory_embeddings.dtype != dtype:
+                memory_embeddings = memory_embeddings.to(device=device, dtype=dtype)
+
+            # STRICT VALIDATION: Ensure exact shape matches expected
+            _num_memories = getattr(self, 'num_memories', getattr(self.memory, 'num_memories', 8))
+            _output_dim = getattr(self, 'output_dim', getattr(self.memory, 'output_dim', 2560))
+            expected_shape = (_num_memories, _output_dim)
+            if memory_embeddings.shape != expected_shape:
+                raise RuntimeError(
+                    f"_empty_memory produced wrong shape! Expected {expected_shape}, got {memory_embeddings.shape}. "
+                    f"This must return exactly {_num_memories} memory embeddings to match placeholder tokens!"
+                )
+
+            # VALIDATE: Ensure grad_fn exists
+            if memory_embeddings.grad_fn is None:
+                raise RuntimeError(
+                    "_empty_memory produced tensor without grad_fn. "
+                    "This will cause backward pass to fail. "
+                    f"memory.training={self.memory.training}, "
+                    f"requires_grad={memory_embeddings.requires_grad}"
+                )
+
+            return memory_embeddings
+
+        finally:
+            # Restore original training mode
+            if not was_training:
+                self.memory.eval()
 
 
 class IdentityProjection(nn.Module, ModalityProjectorProtocol):

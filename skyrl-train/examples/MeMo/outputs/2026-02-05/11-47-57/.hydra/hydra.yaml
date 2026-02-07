@@ -1,0 +1,222 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: RUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=RUN
+    task:
+    - data.train_data=['/home/parsaidp/data/textworld_memo/train.parquet']
+    - data.val_data=['/home/parsaidp/data/textworld_memo/validation.parquet']
+    - environment.env_class=textworld
+    - environment.skyrl_gym.textworld.tokenizer_path=Qwen/Qwen3-4B-Instruct-2507
+    - environment.skyrl_gym.textworld.max_turns=50
+    - environment.skyrl_gym.textworld.memory_window=3
+    - environment.skyrl_gym.textworld.max_memory_docs=20
+    - environment.skyrl_gym.textworld.max_doc_tokens=256
+    - environment.skyrl_gym.textworld.memory_modality_id=memo_memory
+    - generator.max_turns=50
+    - generator.batched=false
+    - generator.refresh_modalities_each_step=true
+    - generator.sampling_params.max_generate_length=64
+    - trainer.algorithm.advantage_estimator=grpo
+    - trainer.algorithm.use_kl_loss=false
+    - trainer.policy.model.path=Qwen/Qwen3-4B-Instruct-2507
+    - trainer.policy.model.freeze_base_model=true
+    - trainer.policy.model.lora.rank=0
+    - trainer.placement.colocate_all=true
+    - trainer.placement.policy_num_gpus_per_node=1
+    - trainer.placement.ref_num_gpus_per_node=1
+    - generator.num_inference_engines=1
+    - generator.inference_engine_tensor_parallel_size=1
+    - trainer.epochs=1
+    - trainer.eval_batch_size=4
+    - trainer.eval_before_train=false
+    - trainer.eval_interval=10
+    - trainer.update_epochs_per_batch=1
+    - trainer.train_batch_size=4
+    - trainer.policy_mini_batch_size=2
+    - trainer.micro_forward_batch_size_per_gpu=2
+    - trainer.micro_train_batch_size_per_gpu=2
+    - trainer.ckpt_interval=10
+    - trainer.max_prompt_length=1024
+    - generator.max_input_length=1024
+    - trainer.policy.optimizer_config.lr=5.0e-5
+    - generator.backend=vllm
+    - generator.run_engines_locally=true
+    - generator.weight_sync_backend=nccl
+    - generator.async_engine=true
+    - generator.gpu_memory_utilization=0.8
+    - trainer.logger=console
+    - trainer.project_name=textworld_memo
+    - trainer.run_name=textworld_memo_debug
+    - trainer.resume_mode=null
+    - trainer.ckpt_path=/home/parsaidp/data/ckpts/textworld_memo_ckpt
+    - +modalities.memo_memory.placeholder_token='<|image_pad|>'
+    - +modalities.memo_memory.max_placeholder_tokens=8
+    - +modalities.memo_memory.encoder.target=skyrl_train.examples.modalities.memo_handlers:MemoTokenMemoryEncoder
+    - +modalities.memo_memory.encoder.kwargs.model_path=Qwen/Qwen3-4B-Instruct-2507
+    - +modalities.memo_memory.encoder.kwargs.embedding_dim=2560
+    - +modalities.memo_memory.encoder.kwargs.output_dim=2560
+    - +modalities.memo_memory.encoder.kwargs.num_memories=8
+    - +modalities.memo_memory.encoder.kwargs.num_heads=8
+    - +modalities.memo_memory.encoder.kwargs.num_layers=1
+    - +modalities.memo_memory.encoder.kwargs.dropout=0.1
+    - +modalities.memo_memory.encoder.kwargs.memory_init=xavier_uniform
+    - +modalities.memo_memory.encoder.kwargs.max_doc_tokens=256
+    - +modalities.memo_memory.encoder.kwargs.memo_repo_root=/home/parsaidp/MeMo
+    - +modalities.memo_memory.projection.target=skyrl_train.examples.modalities.memo_handlers:IdentityProjection
+    - +modalities.memo_memory.projection.kwargs={}
+    - +modalities.memo_memory.trainable.encoder=true
+    - +modalities.memo_memory.trainable.projection=false
+  job:
+    name: main_base
+    chdir: null
+    override_dirname: +modalities.memo_memory.encoder.kwargs.dropout=0.1,+modalities.memo_memory.encoder.kwargs.embedding_dim=2560,+modalities.memo_memory.encoder.kwargs.max_doc_tokens=256,+modalities.memo_memory.encoder.kwargs.memo_repo_root=/home/parsaidp/MeMo,+modalities.memo_memory.encoder.kwargs.memory_init=xavier_uniform,+modalities.memo_memory.encoder.kwargs.model_path=Qwen/Qwen3-4B-Instruct-2507,+modalities.memo_memory.encoder.kwargs.num_heads=8,+modalities.memo_memory.encoder.kwargs.num_layers=1,+modalities.memo_memory.encoder.kwargs.num_memories=8,+modalities.memo_memory.encoder.kwargs.output_dim=2560,+modalities.memo_memory.encoder.target=skyrl_train.examples.modalities.memo_handlers:MemoTokenMemoryEncoder,+modalities.memo_memory.max_placeholder_tokens=8,+modalities.memo_memory.placeholder_token='<|image_pad|>',+modalities.memo_memory.projection.kwargs={},+modalities.memo_memory.projection.target=skyrl_train.examples.modalities.memo_handlers:IdentityProjection,+modalities.memo_memory.trainable.encoder=true,+modalities.memo_memory.trainable.projection=false,data.train_data=['/home/parsaidp/data/textworld_memo/train.parquet'],data.val_data=['/home/parsaidp/data/textworld_memo/validation.parquet'],environment.env_class=textworld,environment.skyrl_gym.textworld.max_doc_tokens=256,environment.skyrl_gym.textworld.max_memory_docs=20,environment.skyrl_gym.textworld.max_turns=50,environment.skyrl_gym.textworld.memory_modality_id=memo_memory,environment.skyrl_gym.textworld.memory_window=3,environment.skyrl_gym.textworld.tokenizer_path=Qwen/Qwen3-4B-Instruct-2507,generator.async_engine=true,generator.backend=vllm,generator.batched=false,generator.gpu_memory_utilization=0.8,generator.inference_engine_tensor_parallel_size=1,generator.max_input_length=1024,generator.max_turns=50,generator.num_inference_engines=1,generator.refresh_modalities_each_step=true,generator.run_engines_locally=true,generator.sampling_params.max_generate_length=64,generator.weight_sync_backend=nccl,trainer.algorithm.advantage_estimator=grpo,trainer.algorithm.use_kl_loss=false,trainer.ckpt_interval=10,trainer.ckpt_path=/home/parsaidp/data/ckpts/textworld_memo_ckpt,trainer.epochs=1,trainer.eval_batch_size=4,trainer.eval_before_train=false,trainer.eval_interval=10,trainer.logger=console,trainer.max_prompt_length=1024,trainer.micro_forward_batch_size_per_gpu=2,trainer.micro_train_batch_size_per_gpu=2,trainer.placement.colocate_all=true,trainer.placement.policy_num_gpus_per_node=1,trainer.placement.ref_num_gpus_per_node=1,trainer.policy.model.freeze_base_model=true,trainer.policy.model.lora.rank=0,trainer.policy.model.path=Qwen/Qwen3-4B-Instruct-2507,trainer.policy.optimizer_config.lr=5.0e-5,trainer.policy_mini_batch_size=2,trainer.project_name=textworld_memo,trainer.resume_mode=null,trainer.run_name=textworld_memo_debug,trainer.train_batch_size=4,trainer.update_epochs_per_batch=1
+    id: ???
+    num: ???
+    config_name: ppo_base_config
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.3'
+    cwd: /home/parsaidp/SkyRL/skyrl-train/examples/MeMo
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /home/parsaidp/SkyRL/skyrl-train/skyrl_train/config
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: /home/parsaidp/SkyRL/skyrl-train/examples/MeMo/outputs/2026-02-05/11-47-57
+    choices:
+      skyrl_gym_config: default
+      megatron_config@trainer.ref.megatron_config: ref
+      megatron_config@trainer.policy.megatron_config: policy
+      deepspeed_config@deepspeed_config.eval: eval
+      deepspeed_config@deepspeed_config.train: train
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false

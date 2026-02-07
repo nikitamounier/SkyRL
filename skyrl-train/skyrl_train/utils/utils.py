@@ -3,6 +3,7 @@ import time
 import sys
 import logging
 import math
+from pathlib import Path
 
 import ray
 import torch
@@ -630,7 +631,11 @@ def initialize_ray(cfg: DictConfig):
     )
 
     env_vars = prepare_runtime_environment(cfg)
-    ray.init(runtime_env={"env_vars": env_vars})
+
+    # Rely on editable install (uv pip install -e .) for code synchronization
+    # This avoids Ray creating new venvs and rebuilding dependencies
+    runtime_env = {"env_vars": env_vars}
+    ray.init(runtime_env=runtime_env)
 
     # create the named ray actors for the registries to make available to all workers
     sync_registries()

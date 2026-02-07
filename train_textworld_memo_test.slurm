@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=train_textworld_memo
-#SBATCH --output=train_textworld_memo_%j.out
-#SBATCH --error=train_textworld_memo_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --partition=gpu
+#SBATCH --job-name=train_tw_test
+#SBATCH --output=train_textworld_memo_test_%j.out
+#SBATCH --error=train_textworld_memo_test_%j.err
+#SBATCH --time=02:00:00
+#SBATCH --partition=preemptible
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -50,7 +50,7 @@ if [ ! -f "$DATA_DIR/train.parquet" ] || [ ! -f "$DATA_DIR/validation.parquet" ]
 fi
 
 echo "========================================="
-echo "Starting TextWorld MeMo training"
+echo "Starting TextWorld MeMo TEST training (2 epochs)"
 echo "Data directory: $DATA_DIR"
 echo "Checkpoint directory: $CKPT_DIR"
 echo "Number of GPUs: $NUM_GPUS"
@@ -62,27 +62,17 @@ export DATA_DIR CKPT_DIR NUM_GPUS LOGGER MODEL_PATH MEMORY_DIM
 export WANDB_ENTITY="${WANDB_ENTITY:-dsp-team}"
 
 # Optional: load W&B API key from file if env var is not set.
-# Put your key in: ~/.wandb_api_key (single line) OR set WANDB_API_KEY in the environment.
 if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.wandb_api_key" ]]; then
     export WANDB_API_KEY="$(cat "$HOME/.wandb_api_key")"
 fi
 
-# If a cache path ending in /snapshots/main was provided, resolve it to the latest snapshot.
-if [[ "$MODEL_PATH" == *"/snapshots/main" && ! -d "$MODEL_PATH" ]]; then
-    BASE_DIR="${MODEL_PATH%/snapshots/main}"
-    if [[ -d "$BASE_DIR/snapshots" ]]; then
-        LATEST_SNAPSHOT="$(ls -1t "$BASE_DIR/snapshots" | head -n 1)"
-        if [[ -n "$LATEST_SNAPSHOT" ]]; then
-            MODEL_PATH="$BASE_DIR/snapshots/$LATEST_SNAPSHOT"
-            export MODEL_PATH
-        fi
-    fi
-fi
-
 cd skyrl-train
-bash examples/MeMo/run_textworld_memo_train.sh
+bash examples/MeMo/run_textworld_memo_train.sh \
+  trainer.epochs=2 \
+  trainer.eval_interval=20 \
+  trainer.ckpt_interval=20 \
+  trainer.run_name="textworld_memo_test_$(date +%Y%m%d_%H%M%S)"
 
 echo "========================================="
-echo "Training completed successfully"
-echo "Checkpoints saved to: $CKPT_DIR"
+echo "Test training completed"
 echo "========================================="

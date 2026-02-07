@@ -7,6 +7,7 @@ For details, see https://skyrl.readthedocs.io/en/latest/tutorials/skyrl_gym_gene
 
 import asyncio
 import copy
+import sys
 from uuid import uuid4
 import skyrl_gym
 from typing import List, Dict, Any, Optional, Union, Tuple
@@ -235,6 +236,18 @@ class SkyRLGymGenerator(GeneratorInterface):
         env_config = self.skyrl_gym_cfg.get(env_class, DictConfig({}))
         env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
 
+        # CRITICAL FIX: Initialize SampleModalityData for online generation
+        # Without this, env._update_modalities_payload() silently returns due to None check
+        if self.refresh_modalities_each_step and "modalities" not in env_extras:
+            from skyrl_train.modalities.batching import SampleModalityData
+            logger.info("[MODALITY INIT] Initializing SampleModalityData for online generation")
+            modalities_data = SampleModalityData(
+                payloads={},  # Will be populated by env._update_modalities_payload()
+                plans={},     # Will be built when payloads are updated
+                occurrence_payloads={}
+            )
+            env_extras["modalities"] = modalities_data
+
         session_id = (
             f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
         )
@@ -281,6 +294,33 @@ class SkyRLGymGenerator(GeneratorInterface):
                 break
 
             if self.refresh_modalities_each_step and single_modalities_batches is not None:
+                # When memory docs appear mid-episode, inject placeholder tokens into input_ids
+                modalities_entry = env_extras.get("modalities")
+                if modalities_entry is not None and self.multimodal_prompt_processor:
+                    for mod_id, plan in modalities_entry.plans.items():
+                        if plan.occurrences > 0 and mod_id not in modalities_entry.embedding_spans:
+                            # Plan exists but no placeholder tokens in input_ids yet
+                            tok_id = self.multimodal_prompt_processor._placeholder_token_ids.get(mod_id)
+                            if tok_id is not None and tok_id not in input_ids:
+                                # Inject placeholder tokens at the beginning of input_ids
+                                num_tokens = sum(plan.reserved_tokens)
+                                placeholder_tokens = [tok_id] * num_tokens
+                                input_ids = placeholder_tokens + input_ids
+                                initial_prompt_length += num_tokens
+                                # Compute embedding spans
+                                from skyrl_train.dataset.modalities import ModalityEmbeddingSpan, collect_embedding_spans
+                                spans = collect_embedding_spans(input_ids, tok_id, plan.reserved_tokens)
+                                modalities_entry.embedding_spans[mod_id] = [
+                                    ModalityEmbeddingSpan(
+                                        modality_id=mod_id,
+                                        occurrence_index=i,
+                                        token_start=start,
+                                        token_length=length,
+                                    )
+                                    for i, (start, length) in enumerate(spans)
+                                ]
+                                logger.info(f"[MODALITY INJECT] Injected {num_tokens} placeholder tokens for {mod_id} at start of input_ids")
+
                 single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
                 if single_modalities_batches:
                     single_modalities_metadata = [self._collect_modalities_metadata(env_extras)]
@@ -332,7 +372,20 @@ class SkyRLGymGenerator(GeneratorInterface):
             step_reward: float = env_step_output["reward"]
             done = env_step_output["done"]
             if isinstance(env_step_output.get("metadata"), dict) and "modalities" in env_step_output["metadata"]:
+                # Preserve existing embedding_spans when merging env metadata
+                # (env only returns payloads/plans, not embedding_spans)
+                existing_spans = {}
+                if isinstance(env_extras.get("modalities"), SampleModalityData):
+                    existing_spans = env_extras["modalities"].embedding_spans
                 env_extras["modalities"] = env_step_output["metadata"]["modalities"]
+                if isinstance(env_extras["modalities"], SampleModalityData) and not env_extras["modalities"].embedding_spans:
+                    env_extras["modalities"].embedding_spans = existing_spans
+
+            # CRITICAL FIX: Refresh modalities payloads with accumulated memory documents
+            # Memory documents are created by env during gameplay, but payloads need to be refreshed
+            if self.refresh_modalities_each_step and hasattr(env, '_update_modalities_payload'):
+                logger.info("[PAYLOAD REFRESH] Calling env._update_modalities_payload() to refresh memory documents")
+                env._update_modalities_payload()
 
             if env_step_output.get("postprocessed_action", None) is not None:
                 # TODO(Charlie): come back to this, we should deprecate postprocessed action
@@ -621,12 +674,30 @@ class SkyRLGymGenerator(GeneratorInterface):
             loss_masks = apply_overlong_filtering(loss_masks, responses, self.tokenizer.eos_token_id)
 
         modalities_metadata_output = [output.modality_metadata for output in all_outputs]
-        if not any(
-            meta.plans or meta.encoder_outputs or meta.projected_embeddings for meta in modalities_metadata_output
-        ):
+
+        # Check if ANY metadata has meaningful content
+        # Note: payloads being an empty list [] or empty dict {} still means modalities are configured,
+        # just no memory docs generated yet (early turns). We should preserve this structure.
+        has_any_content = any(
+            meta.plans
+            or meta.encoder_outputs
+            or meta.projected_embeddings
+            or (meta.payloads is not None)  # Include if payloads is set, even if empty
+            for meta in modalities_metadata_output
+        )
+
+        if not has_any_content:
             modalities_metadata_output_field = None
+            sys.stderr.write(f"[GENERATOR] modalities_metadata_output_field is None (no modalities configured)\n")
         else:
             modalities_metadata_output_field = modalities_metadata_output
+            sys.stderr.write(
+                f"[GENERATOR] Passing {len(modalities_metadata_output_field)} modalities_metadata to trainer\n"
+            )
+            for idx, meta in enumerate(modalities_metadata_output_field):
+                if meta.payloads:
+                    num_payload_groups = len([p for p in meta.payloads.values() if p])
+                    sys.stderr.write(f"[GENERATOR] Sample {idx}: has {num_payload_groups} non-empty payload groups\n")
 
         generator_output: GeneratorOutput = {
             "prompt_token_ids": prompt_token_ids,

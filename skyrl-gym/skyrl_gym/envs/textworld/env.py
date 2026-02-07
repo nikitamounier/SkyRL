@@ -37,6 +37,7 @@ class _IncrementalMemory:
         reward: float,
         score: int,
     ) -> None:
+        import sys
         self.current_segment.append(
             _MemoryTurn(
                 turn=turn,
@@ -47,7 +48,11 @@ class _IncrementalMemory:
                 score=score,
             )
         )
+        sys.stderr.write(f"[MEMORY] Turn {turn}: current_segment has {len(self.current_segment)} turns (window={self.memory_window})\n")
+        sys.stderr.flush()
         if len(self.current_segment) >= self.memory_window:
+            sys.stderr.write(f"[MEMORY] Finalizing segment with {len(self.current_segment)} turns\n")
+            sys.stderr.flush()
             self._finalize_segment()
 
     def finalize(self) -> None:
@@ -55,9 +60,14 @@ class _IncrementalMemory:
             self._finalize_segment()
 
     def _finalize_segment(self) -> None:
+        import sys
         document = self._create_document_text()
+        sys.stderr.write(f"[MEMORY] Created document: {len(document)} chars\n")
+        sys.stderr.flush()
         if document:
             self.memory_documents.append(document)
+            sys.stderr.write(f"[MEMORY] Appended document. Total documents: {len(self.memory_documents)}\n")
+            sys.stderr.flush()
             if len(self.memory_documents) > self.max_documents:
                 self.memory_documents = self.memory_documents[-self.max_documents :]
         self.current_segment = []
@@ -118,6 +128,8 @@ class TextWorldEnv(BaseTextEnv):
         self.tokenizer_path = str(extras.get("tokenizer_path") or env_config.get("tokenizer_path", ""))
 
         self.modality_id = str(extras.get("memory_modality_id") or env_config.get("memory_modality_id", "memo_memory"))
+        self.placeholder_token = str(extras.get("placeholder_token") or env_config.get("placeholder_token", "<|image_pad|>"))
+        self.max_placeholder_tokens = int(extras.get("max_placeholder_tokens") or env_config.get("max_placeholder_tokens", 8))
 
         self._env = None
         self._game_state = None
@@ -160,33 +172,96 @@ class TextWorldEnv(BaseTextEnv):
         return self._env
 
     def _parse_action(self, action: str) -> str:
+        """
+        Parse action from model output. Model generates reasoning + [ACTION: command].
+        We train on the full output but only send the command to the game.
+        """
         if not action:
             return ""
-        cleaned = action.replace("<think>", "").replace("</think>", "").strip()
-        if "</think>" in action:
-            _, after = action.split("</think>", 1)
-            cleaned = after.strip() or cleaned
-        for prefix in ("Action:", "I will", "I'll", "Let me", "I would", "I should"):
-            if cleaned.lower().startswith(prefix.lower()):
-                cleaned = cleaned[len(prefix) :].strip()
-        if "\n" in cleaned:
-            cleaned = cleaned.split("\n", 1)[0].strip()
-        return cleaned.strip('"\'.')
+
+        # Clean UTF-8 encoding issues first
+        try:
+            # Ensure valid UTF-8 encoding
+            action = action.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+        except Exception:
+            action = ""
+
+        if not action:
+            return ""
+
+        # First try to extract [ACTION: ...] format
+        import re
+        action_match = re.search(r'\[ACTION:\s*([^\]]+)\]', action, re.IGNORECASE)
+        if action_match:
+            parsed = action_match.group(1).strip()
+        else:
+            # Fallback: try old parsing logic
+            cleaned = action.replace("<think>", "").replace("</think>", "").strip()
+            if "</think>" in action:
+                _, after = action.split("</think>", 1)
+                cleaned = after.strip() or cleaned
+            for prefix in ("Action:", "I will", "I'll", "Let me", "I would", "I should"):
+                if cleaned.lower().startswith(prefix.lower()):
+                    cleaned = cleaned[len(prefix) :].strip()
+            if "\n" in cleaned:
+                cleaned = cleaned.split("\n", 1)[0].strip()
+            parsed = cleaned.strip('"\'.')
+
+        # Final sanitization: remove any non-ASCII or control characters that might cause issues
+        # Keep only alphanumeric, spaces, and common punctuation
+        import string
+        allowed_chars = string.ascii_letters + string.digits + string.whitespace + "-_.,!?'"
+        parsed = ''.join(c for c in parsed if c in allowed_chars)
+
+        # Ensure it's valid UTF-8 and limited length
+        parsed = parsed.strip()[:200]  # Limit action length
+
+        return parsed
 
     def _update_modalities_payload(self) -> None:
+        import sys
         modalities_entry = self.extras.get("modalities")
         if modalities_entry is None or not hasattr(modalities_entry, "payloads"):
+            sys.stderr.write(f"[ENV PAYLOAD] modalities_entry is None or has no payloads\n")
+            sys.stderr.flush()
             return
 
         documents = list(self._memory.memory_documents)
-        payloads: List[List[int]] = []
-        for doc in documents:
-            payloads.append(self._encode_document(doc))
+        sys.stderr.write(f"[ENV PAYLOAD] Found {len(documents)} memory documents\n")
+        sys.stderr.flush()
 
-        while len(payloads) < self.max_memory_docs:
-            payloads.append([])
+        from skyrl_train.dataset.modalities import ModalityPlaceholderPlan
 
-        modalities_entry.payloads[self.modality_id] = payloads
+        if len(documents) > 0:
+            payloads: List[List[int]] = []
+            for idx, doc in enumerate(documents):
+                encoded = self._encode_document(doc)
+                sys.stderr.write(f"[ENV PAYLOAD] Doc {idx}: {len(doc) if doc else 0} chars -> {len(encoded)} tokens\n")
+                sys.stderr.flush()
+                payloads.append(encoded)
+
+            while len(payloads) < self.max_memory_docs:
+                payloads.append([])
+
+            modalities_entry.payloads[self.modality_id] = payloads
+
+            num_docs_with_content = sum(1 for p in payloads if p)
+            plan = ModalityPlaceholderPlan(
+                modality_id=self.modality_id,
+                placeholder_token=self.placeholder_token,
+                occurrences=num_docs_with_content,
+                reserved_tokens=[self.max_placeholder_tokens] * num_docs_with_content,
+                payload=payloads[:num_docs_with_content],
+            )
+            modalities_entry.plans[self.modality_id] = plan
+            sys.stderr.write(f"[ENV PLAN] Created plan: {num_docs_with_content} docs, {self.max_placeholder_tokens} tokens each\n")
+            sys.stderr.flush()
+        else:
+            # No documents - clear payloads and plans
+            modalities_entry.payloads.pop(self.modality_id, None)
+            modalities_entry.plans.pop(self.modality_id, None)
+            sys.stderr.write(f"[ENV PLAN] No documents, cleared payloads and plan\n")
+            sys.stderr.flush()
 
     def _encode_document(self, text: str) -> List[int]:
         if not text:
@@ -221,20 +296,45 @@ class TextWorldEnv(BaseTextEnv):
 
         self._update_modalities_payload()
 
-        self._last_observation = self._game_state.feedback.strip()
+        # Handle Unicode errors in game feedback
+        try:
+            feedback = self._game_state.feedback.strip()
+        except (UnicodeDecodeError, AttributeError) as e:
+            # If feedback has encoding issues, try to clean it
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Unicode error in game feedback: {e}. Attempting to clean...")
+            try:
+                # Try to encode and decode with error handling
+                if isinstance(self._game_state.feedback, bytes):
+                    feedback = self._game_state.feedback.decode('utf-8', errors='replace').strip()
+                else:
+                    # If it's already a string, try to re-encode and decode
+                    feedback = str(self._game_state.feedback).encode('utf-8', errors='replace').decode('utf-8').strip()
+            except Exception as e2:
+                logger.error(f"Failed to clean feedback: {e2}. Using placeholder.")
+                feedback = "[Game output could not be decoded]"
+        self._last_observation = feedback
         done = done or self.turns >= self.max_turns
 
         observations = [] if done else [{"role": "user", "content": self._last_observation}]
+
+        metadata = {
+            "action": parsed_action,
+            "score": int(score),
+            "won": bool(getattr(self._game_state, "won", False)),
+        }
+
+        # Include modalities if available (updated by _update_modalities_payload)
+        modalities_entry = self.extras.get("modalities")
+        if modalities_entry is not None:
+            metadata["modalities"] = modalities_entry
 
         return BaseTextEnvStepOutput(
             observations=observations,
             reward=float(reward),
             done=done,
-            metadata={
-                "action": parsed_action,
-                "score": int(score),
-                "won": bool(getattr(self._game_state, "won", False)),
-            },
+            metadata=metadata,
         )
 
     def close(self):

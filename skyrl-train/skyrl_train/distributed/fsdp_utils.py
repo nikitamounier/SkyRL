@@ -281,6 +281,12 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     if dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
+
+            # Skip non-DTensor items (e.g., buffers) - they don't need sharding
+            if not hasattr(sharded_param, 'device_mesh'):
+                sharded_sd[param_name] = full_param
+                continue
+
             mesh = sharded_param.device_mesh
             dist.broadcast(full_param, src=0)
             sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
@@ -295,6 +301,13 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
             full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
+
+            # Skip non-DTensor items (e.g., buffers) - they don't need sharding
+            if not hasattr(sharded_param, 'device_mesh'):
+                dist.broadcast(full_tensor, src=0)
+                sharded_sd[param_name] = full_tensor
+                continue
+
             mesh = sharded_param.device_mesh
             dist.broadcast(full_tensor, src=0)
             sharded_tensor = distribute_tensor(full_tensor, mesh, sharded_param.placements)
@@ -370,6 +383,11 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     modules = []
     for name, module in model.named_modules():
+        # Skip modality encoders and projections - these are small modules that don't benefit from FSDP
+        # and cause DTensor handling issues when trainable
+        if name.startswith("_skyrl_modality_encoders.") or name.startswith("_skyrl_modality_projections."):
+            continue
+
         if module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap or (
             isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings
         ):
@@ -377,7 +395,31 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     for idx, module in enumerate(modules):
         fully_shard(module, **fsdp_kwargs)
+
+    # CRITICAL FIX: Temporarily detach modality encoders/projections before root FSDP wrap
+    # to prevent them from being converted to DTensor (which breaks MultiheadAttention)
+    saved_modality_encoders = {}
+    saved_modality_projections = {}
+
+    if hasattr(model, '_skyrl_modality_encoders'):
+        saved_modality_encoders = dict(model._skyrl_modality_encoders.named_children())
+        model._skyrl_modality_encoders = nn.ModuleDict()  # Replace with empty ModuleDict
+
+    if hasattr(model, '_skyrl_modality_projections'):
+        saved_modality_projections = dict(model._skyrl_modality_projections.named_children())
+        model._skyrl_modality_projections = nn.ModuleDict()  # Replace with empty ModuleDict
+
+    # Now wrap root model - modality modules won't be wrapped
     fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
+
+    # Restore modality encoders/projections as regular (non-FSDP) modules
+    if saved_modality_encoders:
+        for name, module in saved_modality_encoders.items():
+            model._skyrl_modality_encoders[name] = module
+
+    if saved_modality_projections:
+        for name, module in saved_modality_projections.items():
+            model._skyrl_modality_projections[name] = module
 
 
 def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):

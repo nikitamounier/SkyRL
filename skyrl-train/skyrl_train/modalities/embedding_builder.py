@@ -134,31 +134,84 @@ class PromptEmbeddingBuilder:
         prompt_token_ids: Sequence[Sequence[int]],
         modality_replacements: Dict[int, List[Tuple[EmbeddingSpan, torch.Tensor]]],
     ) -> List[torch.Tensor]:
-        outputs: List[torch.Tensor] = []
-        for sample_idx, token_ids in enumerate(prompt_token_ids):
-            token_tensor = torch.tensor(token_ids, device=self.device, dtype=torch.long)
-            # Mask out modality placeholder spans before embedding to avoid out-of-range ids
-            for (start, length), _ in modality_replacements.get(sample_idx, []):
-                end = start + length
-                if start < 0 or end > token_tensor.shape[0]:
-                    raise ValueError(
-                        f"Replacement span ({start}, {length}) exceeds prompt length {token_tensor.shape[0]}."
-                    )
-                token_tensor[start:end] = 0
-            embeds = self.gather_base_embeddings(token_tensor)
-            for (start, length), modality_tensor in modality_replacements.get(sample_idx, []):
-                end = start + length
-                if end > embeds.shape[0]:
-                    raise ValueError(
-                        f"Replacement span ({start}, {length}) exceeds prompt length {embeds.shape[0]}."
-                    )
-                if modality_tensor.shape[1] != embeds.shape[1]:
-                    raise ValueError(
-                        "Projection hidden size mismatch. Expected %d, got %d."
-                        % (embeds.shape[1], modality_tensor.shape[1])
-                    )
-                embeds[start:end, :] = modality_tensor[:length]
-            outputs.append(embeds)
+        # CRITICAL FIX: Wrap in torch.enable_grad() to ensure all embeddings get grad_fn
+        # Even if they're built from detached base embeddings
+        with torch.enable_grad():
+            from loguru import logger
+            outputs: List[torch.Tensor] = []
+            for sample_idx, token_ids in enumerate(prompt_token_ids):
+                token_tensor = torch.tensor(token_ids, device=self.device, dtype=torch.long)
+                # Mask out modality placeholder spans before embedding to avoid out-of-range ids
+                for (start, length), _ in modality_replacements.get(sample_idx, []):
+                    end = start + length
+                    if start < 0 or end > token_tensor.shape[0]:
+                        raise ValueError(
+                            f"Replacement span ({start}, {length}) exceeds prompt length {token_tensor.shape[0]}."
+                        )
+                    token_tensor[start:end] = 0
+                embeds = self.gather_base_embeddings(token_tensor)
+
+                # If there are modality replacements, build the tensor by concatenating slices
+                # to preserve gradient flow (in-place assignment breaks gradients)
+                replacements = modality_replacements.get(sample_idx, [])
+
+                logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: {len(replacements)} modality replacements")
+                logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'NONE'}")
+
+                if replacements:
+                    # Validate all replacements first
+                    for (start, length), modality_tensor in replacements:
+                        end = start + length
+                        if end > embeds.shape[0]:
+                            raise ValueError(
+                                f"Replacement span ({start}, {length}) exceeds prompt length {embeds.shape[0]}."
+                            )
+                        if modality_tensor.shape[1] != embeds.shape[1]:
+                            raise ValueError(
+                                "Projection hidden size mismatch. Expected %d, got %d."
+                                % (embeds.shape[1], modality_tensor.shape[1])
+                            )
+
+                    # Build the final tensor by concatenating base and modality embeddings
+                    # Sort replacements by start position to process them in order
+                    sorted_replacements = sorted(replacements, key=lambda x: x[0][0])
+                    parts = []
+                    last_end = 0
+
+                    for idx, ((start, length), modality_tensor) in enumerate(sorted_replacements):
+                        end = start + length
+                        # Add base embeddings before this modality span
+                        if start > last_end:
+                            parts.append(embeds[last_end:start])
+                        # Add modality embeddings
+                        parts.append(modality_tensor[:length])
+                        last_end = end
+
+                    # Add remaining base embeddings after the last modality span
+                    if last_end < embeds.shape[0]:
+                        parts.append(embeds[last_end:])
+
+                    embeds = torch.cat(parts, dim=0)
+                    logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: After concat, grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'NONE'}")
+                else:
+                    # CRITICAL FIX: If no modality embeddings, add dummy gradient
+                    # Base embeddings are detached, so multiply by trainable scalar to give grad_fn
+                    logger.warning(f"[EMBEDDING BUILDER] Sample {sample_idx}: NO modality replacements - adding dummy gradient")
+                    if embeds.grad_fn is None:
+                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds have NO grad_fn, multiplying by dummy_scale")
+                        dummy_scale = torch.ones(1, requires_grad=True, device=embeds.device, dtype=embeds.dtype)
+                        embeds = embeds * dummy_scale
+                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: After dummy_scale, grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'STILL NONE!'}")
+                    else:
+                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds already have grad_fn: {type(embeds.grad_fn).__name__}")
+
+                # Final check before appending
+                if embeds.grad_fn is None:
+                    logger.error(f"[EMBEDDING BUILDER] Sample {sample_idx}: FINAL embeds have NO grad_fn - backward will fail!")
+                else:
+                    logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: FINAL embeds have grad_fn: {type(embeds.grad_fn).__name__}")
+
+                outputs.append(embeds)
         return outputs
 
 

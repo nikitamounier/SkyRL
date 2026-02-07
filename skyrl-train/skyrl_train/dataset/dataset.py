@@ -15,7 +15,7 @@ class PromptDataset:
         datasets: str | List[str],
         tokenizer: PreTrainedTokenizerBase,
         max_prompt_length: int,
-        num_workers: int = 8,
+        num_workers: int = 1,  # Changed from 8: multiprocessing corrupts complex nested structures
         prompt_key: str = "prompt",
         env_class_key: str = "env_class",
         modalities_config: Optional[dict] = None,

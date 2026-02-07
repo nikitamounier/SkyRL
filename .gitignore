@@ -50,3 +50,5 @@ uv.lock
 *.err
 *.out
 
+*.txt
+
