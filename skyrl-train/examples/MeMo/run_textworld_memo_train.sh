@@ -80,7 +80,7 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.ckpt_interval=50 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.max_input_length=$MAX_PROMPT_LENGTH \
-  trainer.policy.optimizer_config.lr=5.0e-5 \
+  trainer.policy.optimizer_config.lr=5.0e-4 \
   generator.backend=$INFERENCE_BACKEND \
   generator.run_engines_locally=true \
   generator.weight_sync_backend=nccl \

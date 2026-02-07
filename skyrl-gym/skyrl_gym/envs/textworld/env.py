@@ -37,7 +37,6 @@ class _IncrementalMemory:
         reward: float,
         score: int,
     ) -> None:
-        import sys
         self.current_segment.append(
             _MemoryTurn(
                 turn=turn,
@@ -48,11 +47,7 @@ class _IncrementalMemory:
                 score=score,
             )
         )
-        sys.stderr.write(f"[MEMORY] Turn {turn}: current_segment has {len(self.current_segment)} turns (window={self.memory_window})\n")
-        sys.stderr.flush()
         if len(self.current_segment) >= self.memory_window:
-            sys.stderr.write(f"[MEMORY] Finalizing segment with {len(self.current_segment)} turns\n")
-            sys.stderr.flush()
             self._finalize_segment()
 
     def finalize(self) -> None:
@@ -60,14 +55,9 @@ class _IncrementalMemory:
             self._finalize_segment()
 
     def _finalize_segment(self) -> None:
-        import sys
         document = self._create_document_text()
-        sys.stderr.write(f"[MEMORY] Created document: {len(document)} chars\n")
-        sys.stderr.flush()
         if document:
             self.memory_documents.append(document)
-            sys.stderr.write(f"[MEMORY] Appended document. Total documents: {len(self.memory_documents)}\n")
-            sys.stderr.flush()
             if len(self.memory_documents) > self.max_documents:
                 self.memory_documents = self.memory_documents[-self.max_documents :]
         self.current_segment = []
@@ -152,6 +142,11 @@ class TextWorldEnv(BaseTextEnv):
         )
         self._last_observation = self._game_state.feedback.strip()
 
+        # Keep a reference to the system message dict so we can dynamically
+        # inject placeholder tokens when memory documents are created.
+        self._system_message = prompt[0] if prompt else None
+        self._base_system_content = prompt[0]["content"] if prompt else ""
+
         self._update_modalities_payload()
 
         first_obs = {"role": "user", "content": self._last_observation}
@@ -219,33 +214,37 @@ class TextWorldEnv(BaseTextEnv):
         return parsed
 
     def _update_modalities_payload(self) -> None:
-        import sys
         modalities_entry = self.extras.get("modalities")
         if modalities_entry is None or not hasattr(modalities_entry, "payloads"):
-            sys.stderr.write(f"[ENV PAYLOAD] modalities_entry is None or has no payloads\n")
-            sys.stderr.flush()
             return
 
         documents = list(self._memory.memory_documents)
-        sys.stderr.write(f"[ENV PAYLOAD] Found {len(documents)} memory documents\n")
-        sys.stderr.flush()
 
         from skyrl_train.dataset.modalities import ModalityPlaceholderPlan
 
-        if len(documents) > 0:
+        if documents:
+            # Encode each document to token IDs
             payloads: List[List[int]] = []
-            for idx, doc in enumerate(documents):
-                encoded = self._encode_document(doc)
-                sys.stderr.write(f"[ENV PAYLOAD] Doc {idx}: {len(doc) if doc else 0} chars -> {len(encoded)} tokens\n")
-                sys.stderr.flush()
-                payloads.append(encoded)
+            for doc in documents:
+                payloads.append(self._encode_document(doc))
 
-            while len(payloads) < self.max_memory_docs:
-                payloads.append([])
+            num_docs_with_content = sum(1 for p in payloads if p)
+
+            # Dynamically inject placeholder tokens into the system message
+            # so the modalities framework can find and replace them.
+            if self._system_message is not None and num_docs_with_content > 0:
+                per_doc_block = " ".join(
+                    [self.placeholder_token] * self.max_placeholder_tokens
+                )
+                placeholder_text = "\n".join(
+                    per_doc_block for _ in range(num_docs_with_content)
+                )
+                self._system_message["content"] = (
+                    f"{self._base_system_content}\n{placeholder_text}"
+                )
 
             modalities_entry.payloads[self.modality_id] = payloads
 
-            num_docs_with_content = sum(1 for p in payloads if p)
             plan = ModalityPlaceholderPlan(
                 modality_id=self.modality_id,
                 placeholder_token=self.placeholder_token,
@@ -254,14 +253,12 @@ class TextWorldEnv(BaseTextEnv):
                 payload=payloads[:num_docs_with_content],
             )
             modalities_entry.plans[self.modality_id] = plan
-            sys.stderr.write(f"[ENV PLAN] Created plan: {num_docs_with_content} docs, {self.max_placeholder_tokens} tokens each\n")
-            sys.stderr.flush()
         else:
-            # No documents - clear payloads and plans
+            # No documents — restore clean system message, clear plan
+            if self._system_message is not None:
+                self._system_message["content"] = self._base_system_content
             modalities_entry.payloads.pop(self.modality_id, None)
             modalities_entry.plans.pop(self.modality_id, None)
-            sys.stderr.write(f"[ENV PLAN] No documents, cleared payloads and plan\n")
-            sys.stderr.flush()
 
     def _encode_document(self, text: str) -> List[int]:
         if not text:

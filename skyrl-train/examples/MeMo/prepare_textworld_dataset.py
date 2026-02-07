@@ -61,11 +61,13 @@ def _generate_games(
 
 
 def _build_prompt(placeholder_token: str, max_memory_docs: int) -> List[Dict[str, str]]:
-    placeholder_block = " ".join([placeholder_token] * max_memory_docs)
+    # No placeholder tokens in the initial prompt.  The TextWorld environment
+    # dynamically injects placeholder blocks into the system message as memory
+    # documents are created during gameplay.  This avoids feeding the model
+    # meaningless placeholder embeddings before any memory exists.
     system_text = (
         "You are playing a text-based adventure game. "
-        "Respond with a single action command (e.g., 'look', 'go north', 'take key').\n"
-        f"Memory slots: {placeholder_block}"
+        "Respond with a single action command (e.g., 'look', 'go north', 'take key')."
     )
     return [{"role": "system", "content": system_text}]
 

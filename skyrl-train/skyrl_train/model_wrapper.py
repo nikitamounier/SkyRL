@@ -230,6 +230,17 @@ class HFModelWrapper(nn.Module):
 
         self._freeze_base_model = freeze_base_model
 
+        # Resolve placeholder token IDs for modalities (needed for embedding span computation)
+        if self.modalities_manager is not None:
+            model_path = getattr(self.model.config, '_name_or_path', None) if hasattr(self.model, 'config') else None
+            if model_path:
+                try:
+                    from transformers import AutoTokenizer
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    self.modalities_manager.resolve_placeholder_token_ids(tokenizer)
+                except Exception as e:
+                    logger.warning(f"Could not resolve placeholder token IDs: {e}")
+
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
         self.chunked_entropy_from_logits_fn = (
@@ -472,6 +483,11 @@ class HFModelWrapper(nn.Module):
         if not has_plans:
             logger.warning(f"[MODALITY CHECK] No plans found, returning base_embeddings")
             return base_embeddings, modalities_metadata
+
+        # Ensure embedding_spans are computed from actual input_ids.
+        # During online RL, spans may be lost when env metadata is refreshed mid-episode.
+        if self.modalities_manager:
+            self.modalities_manager.ensure_embedding_spans(input_ids, samples_metadata)
 
         modality_batches = build_modality_batches(samples_metadata)
         if not modality_batches:
