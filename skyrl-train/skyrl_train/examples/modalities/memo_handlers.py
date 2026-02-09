@@ -547,7 +547,6 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             memory_init=memory_init,
         )
 
-        # Store for validation (accessible via self.memory too, but keep here for convenience)
         self.num_memories = num_memories
         self.embedding_dim = embedding_dim
         self.output_dim = output_dim
@@ -601,7 +600,6 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         ref_tensor = ref_param if ref_param is not None else self.embedding_weight
         device, dtype = _local_device_dtype(ref_tensor)
 
-        # Access config values safely (FSDP wrapping may change attribute access)
         embedding_dim = getattr(self, 'embedding_dim', getattr(self.memory, 'embedding_dim', 2560))
         num_memories = getattr(self, 'num_memories', getattr(self.memory, 'num_memories', 8))
         output_dim = getattr(self, 'output_dim', getattr(self.memory, 'output_dim', 2560))
@@ -669,6 +667,197 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         raise TypeError(
             f"Modality `{self.modality_id}` expected token id list, got {type(value).__name__}."
         )
+
+
+class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
+    """Memory encoder using a dedicated embedding model (e.g. Qwen3-Embedding-4B).
+
+    Matches the MeMo reference approach: documents are embedded with a
+    SentenceTransformer model producing one semantic vector per document,
+    then passed through the Memory module to produce memory tokens.
+
+    Payloads should be raw text strings (not token ids).
+    """
+
+    def __init__(
+        self,
+        modality_id: str,
+        role: str,
+        *,
+        embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
+        embedding_dim: int = 2560,
+        num_memories: int = 8,
+        output_dim: int = 2560,
+        num_heads: int = 8,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        memory_init: str = "xavier_uniform",
+        embedding_device: str = "cpu",
+        memo_repo_root: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_prefix: str = "memory.",
+        **_: Any,
+    ) -> None:
+        super().__init__()
+        self.modality_id = modality_id
+        self.role = role
+        self.embedding_dim = embedding_dim
+        self.num_memories = num_memories
+        self.output_dim = output_dim
+
+        # Load the Memory module (same architecture as MeMo reference)
+        Memory = _import_memo_memory(memo_repo_root)
+        self.memory = Memory(
+            embedding_dim=embedding_dim,
+            num_memories=num_memories,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+            memory_init=memory_init,
+        )
+
+        # Zero-init the output projection so the Memory module starts by
+        # producing zero embeddings. This prevents the catastrophic gradient
+        # explosion on step 1 — the LLM sees zeros (like padding) instead of
+        # random garbage. Training gradually learns to produce useful outputs.
+        if hasattr(self.memory, 'memory_projection'):
+            nn.init.zeros_(self.memory.memory_projection.weight)
+            if self.memory.memory_projection.bias is not None:
+                nn.init.zeros_(self.memory.memory_projection.bias)
+
+        # Load embedding model on CPU to avoid GPU memory competition
+        self._embedding_device = embedding_device
+        self._embedding_model_name = embedding_model_name
+        self._embedding_model = None  # Lazy-load on first use
+
+        if checkpoint_path:
+            self._load_checkpoint(checkpoint_path, prefix=checkpoint_prefix)
+
+    def _get_embedding_model(self):
+        """Lazy-load the SentenceTransformer model on first use."""
+        if self._embedding_model is None:
+            from sentence_transformers import SentenceTransformer
+            logger.info(
+                "Loading embedding model %s on %s",
+                self._embedding_model_name,
+                self._embedding_device,
+            )
+            self._embedding_model = SentenceTransformer(
+                self._embedding_model_name,
+                model_kwargs={
+                    "device_map": self._embedding_device,
+                    "torch_dtype": torch.bfloat16,
+                },
+                tokenizer_kwargs={"padding_side": "left"},
+            )
+        return self._embedding_model
+
+    def _load_checkpoint(self, checkpoint_path: str, *, prefix: str) -> None:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = state.get("state_dict", state)
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict.")
+        filtered = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        if not filtered:
+            logger.warning(
+                "No parameters matched prefix '%s' in checkpoint %s; loading full state_dict.",
+                prefix,
+                checkpoint_path,
+            )
+            filtered = state_dict
+        missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
+        if missing:
+            logger.warning("Missing keys when loading memory checkpoint: %s", missing)
+        if unexpected:
+            logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
+
+    def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
+        """Encode payloads into memory tokens.
+
+        Each payload is a list of document texts (all docs for one game).
+        We embed all docs with SentenceTransformer, stack to [1, num_docs, 2560],
+        and pass through the Memory module's cross-attention to produce
+        [num_memories, output_dim] — matching the MeMo reference architecture.
+        """
+        outputs: List[torch.Tensor] = []
+        ref_param = next(self.memory.parameters(), None)
+        device = ref_param.device if ref_param is not None else torch.device("cpu")
+        dtype = ref_param.dtype if ref_param is not None else torch.bfloat16
+
+        for idx, payload in enumerate(payloads):
+            texts = self._resolve_texts(payload)
+            if not texts:
+                outputs.append(torch.zeros(self.num_memories, self.output_dim, device=device, dtype=dtype))
+                continue
+
+            # Embed ALL documents with SentenceTransformer (frozen, on CPU)
+            model = self._get_embedding_model()
+            with torch.no_grad():
+                embeddings = model.encode(
+                    texts,
+                    convert_to_numpy=False,
+                    show_progress_bar=False,
+                )
+            # embeddings: either a single tensor [num_docs, dim] or a list of tensors
+            if isinstance(embeddings, torch.Tensor):
+                doc_embeds = embeddings.to(device=device, dtype=dtype)
+            elif isinstance(embeddings, (list, tuple)):
+                doc_embeds = torch.stack([
+                    t.to(device=device, dtype=dtype) if isinstance(t, torch.Tensor)
+                    else torch.tensor(t, device=device, dtype=dtype)
+                    for t in embeddings
+                ])
+            else:
+                doc_embeds = torch.tensor(embeddings, device=device, dtype=dtype)
+
+            if doc_embeds.dim() == 1:
+                doc_embeds = doc_embeds.unsqueeze(0)  # [1, embedding_dim]
+
+            # Reshape to [1, num_docs, embedding_dim] for Memory module
+            doc_embeds = doc_embeds.unsqueeze(0).detach()  # [1, num_docs, 2560]
+
+            # Memory module forward pass — cross-attention over all documents
+            # 8 queries attend to num_docs positions, producing diverse outputs
+            with torch.enable_grad():
+                memory_embeddings, _ = self.memory(doc_embeds, padding_mask=None)
+
+            expected_shape = (1, self.num_memories, self.output_dim)
+            if memory_embeddings.shape != expected_shape:
+                raise RuntimeError(
+                    f"Sample {idx}: Memory module returned {tuple(memory_embeddings.shape)}, "
+                    f"expected {expected_shape}"
+                )
+
+            outputs.append(memory_embeddings.squeeze(0).to(dtype=dtype))
+
+        return outputs
+
+    def _resolve_texts(self, payload: Any) -> List[str]:
+        """Extract list of document texts from payload.
+
+        Payload can be:
+        - List[str]: list of document texts (expected from env)
+        - str: single document text
+        - None/empty: no documents
+        """
+        if payload is None:
+            return []
+        if isinstance(payload, str):
+            text = payload.strip()
+            return [text] if text else []
+        if isinstance(payload, (list, tuple)):
+            # List of strings (expected)
+            if payload and isinstance(payload[0], str):
+                return [t.strip() for t in payload if isinstance(t, str) and t.strip()]
+            # List of ints (old token_ids format)
+            if payload and isinstance(payload[0], int):
+                logger.warning(
+                    "MemoSentenceEmbeddingEncoder received token_ids instead of text. "
+                    "Update TextWorld env to pass raw text payloads."
+                )
+                return []
+        return []
 
 
 class IdentityProjection(nn.Module, ModalityProjectorProtocol):

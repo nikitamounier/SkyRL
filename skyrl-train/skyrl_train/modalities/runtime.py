@@ -137,7 +137,7 @@ class ModalitiesManager:
                         for i, (start, length) in enumerate(spans)
                     ]
                 except ValueError as e:
-                    logger.warning(f"ensure_embedding_spans: sample {sample_idx}, {mod_id}: {e}")
+                    logger.debug(f"ensure_embedding_spans: sample {sample_idx}, {mod_id}: {e}")
                     # Last resort: remove the plan entirely
                     del meta.plans[mod_id]
                     meta.payloads.pop(mod_id, None)

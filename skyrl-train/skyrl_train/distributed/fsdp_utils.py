@@ -396,8 +396,7 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     for idx, module in enumerate(modules):
         fully_shard(module, **fsdp_kwargs)
 
-    # CRITICAL FIX: Temporarily detach modality encoders/projections before root FSDP wrap
-    # to prevent them from being converted to DTensor (which breaks MultiheadAttention)
+    # Exclude modality modules from root FSDP wrap to avoid DTensor issues
     saved_modality_encoders = {}
     saved_modality_projections = {}
 

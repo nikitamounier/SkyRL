@@ -7,7 +7,6 @@ For details, see https://skyrl.readthedocs.io/en/latest/tutorials/skyrl_gym_gene
 
 import asyncio
 import copy
-import sys
 from uuid import uuid4
 import skyrl_gym
 from typing import List, Dict, Any, Optional, Union, Tuple
@@ -236,16 +235,12 @@ class SkyRLGymGenerator(GeneratorInterface):
         env_config = self.skyrl_gym_cfg.get(env_class, DictConfig({}))
         env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
 
-        # CRITICAL FIX: Initialize SampleModalityData for online generation
-        # Without this, env._update_modalities_payload() silently returns due to None check
         if self.refresh_modalities_each_step and "modalities" not in env_extras:
-            logger.info("[MODALITY INIT] Initializing SampleModalityData for online generation")
-            modalities_data = SampleModalityData(
-                payloads={},  # Will be populated by env._update_modalities_payload()
-                plans={},     # Will be built when payloads are updated
+            env_extras["modalities"] = SampleModalityData(
+                payloads={},
+                plans={},
                 occurrence_payloads={}
             )
-            env_extras["modalities"] = modalities_data
 
         session_id = (
             f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
@@ -310,8 +305,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                             extra = needed_tokens - existing_tokens
                             input_ids = [tok_id] * extra + input_ids
                             initial_prompt_length += extra
-                            logger.info(f"[MODALITY INJECT] Injected {extra} extra placeholder tokens for {mod_id} (total: {needed_tokens})")
-                        # Always recompute embedding spans from current input_ids
+                        # Recompute embedding spans from current input_ids
                         spans = collect_embedding_spans(input_ids, tok_id, plan.reserved_tokens)
                         modalities_entry.embedding_spans[mod_id] = [
                             ModalityEmbeddingSpan(
@@ -383,10 +377,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 if isinstance(env_extras["modalities"], SampleModalityData) and not env_extras["modalities"].embedding_spans:
                     env_extras["modalities"].embedding_spans = existing_spans
 
-            # CRITICAL FIX: Refresh modalities payloads with accumulated memory documents
-            # Memory documents are created by env during gameplay, but payloads need to be refreshed
             if self.refresh_modalities_each_step and hasattr(env, '_update_modalities_payload'):
-                logger.info("[PAYLOAD REFRESH] Calling env._update_modalities_payload() to refresh memory documents")
                 env._update_modalities_payload()
 
             if env_step_output.get("postprocessed_action", None) is not None:
@@ -482,13 +473,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                     token_level_rewards[idx] += step_reward
             reward_out = token_level_rewards
 
-        # Final recompute of embedding_spans before returning metadata for training.
-        # Env.step overwrites metadata on the last iteration, losing spans.
-        # Use the final input_ids (which contain all injected placeholder tokens) to recompute.
+        # Recompute embedding_spans before returning — env.step may have overwritten them.
         final_modalities = env_extras.get("modalities")
-        logger.info(f"[FINAL SPANS] final_modalities type={type(final_modalities).__name__}, "
-                     f"is_SMD={isinstance(final_modalities, SampleModalityData) if final_modalities else 'N/A'}, "
-                     f"has_processor={self.multimodal_prompt_processor is not None}")
         if final_modalities is not None and isinstance(final_modalities, SampleModalityData) and self.multimodal_prompt_processor:
             from skyrl_train.dataset.modalities import ModalityEmbeddingSpan, collect_embedding_spans
             for mod_id, plan in final_modalities.plans.items():
@@ -497,18 +483,12 @@ class SkyRLGymGenerator(GeneratorInterface):
                 tok_id = self.multimodal_prompt_processor._placeholder_token_ids.get(mod_id)
                 if tok_id is None:
                     continue
-                # Count placeholder tokens in input_ids
                 num_placeholder = input_ids.count(tok_id) if isinstance(input_ids, list) else 0
                 needed = sum(plan.reserved_tokens)
-                logger.info(f"[FINAL SPANS] {mod_id}: plan.occurrences={plan.occurrences}, "
-                             f"reserved_tokens={plan.reserved_tokens}, "
-                             f"placeholder_tokens_in_ids={num_placeholder}, needed={needed}")
                 if num_placeholder < needed:
-                    # Not enough placeholder tokens - inject more
                     extra = needed - num_placeholder
                     input_ids = [tok_id] * extra + input_ids
                     initial_prompt_length += extra
-                    logger.info(f"[FINAL SPANS] Injected {extra} extra tokens for {mod_id}")
                 try:
                     spans = collect_embedding_spans(input_ids, tok_id, plan.reserved_tokens)
                     final_modalities.embedding_spans[mod_id] = [
@@ -520,11 +500,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                         )
                         for i, (start, length) in enumerate(spans)
                     ]
-                    logger.info(f"[FINAL SPANS] Computed {len(spans)} spans for {mod_id}")
-                except ValueError as e:
-                    logger.warning(f"[FINAL SPANS] Could not compute spans for {mod_id}: {e}")
-        elif final_modalities is not None and not isinstance(final_modalities, SampleModalityData):
-            logger.warning(f"[FINAL SPANS] final_modalities is {type(final_modalities).__name__}, not SampleModalityData!")
+                except ValueError:
+                    pass
 
         # Update prompt_ids to account for any additional injections
         prompt_ids = input_ids[:initial_prompt_length]
@@ -737,16 +714,8 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         if not has_any_content:
             modalities_metadata_output_field = None
-            sys.stderr.write(f"[GENERATOR] modalities_metadata_output_field is None (no modalities configured)\n")
         else:
             modalities_metadata_output_field = modalities_metadata_output
-            sys.stderr.write(
-                f"[GENERATOR] Passing {len(modalities_metadata_output_field)} modalities_metadata to trainer\n"
-            )
-            for idx, meta in enumerate(modalities_metadata_output_field):
-                if meta.payloads:
-                    num_payload_groups = len([p for p in meta.payloads.values() if p])
-                    sys.stderr.write(f"[GENERATOR] Sample {idx}: has {num_payload_groups} non-empty payload groups\n")
 
         generator_output: GeneratorOutput = {
             "prompt_token_ids": prompt_token_ids,

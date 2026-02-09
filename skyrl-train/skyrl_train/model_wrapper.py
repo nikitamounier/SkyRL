@@ -449,9 +449,6 @@ class HFModelWrapper(nn.Module):
             Tuple of (inputs_embeds, modalities_metadata). The metadata list is returned unchanged unless
             `update_metadata=True`, in which case the same list (potentially mutated) is returned.
         """
-        # CODE SYNC TEST: This log message verifies Ray loads fresh source code
-        logger.info("[CODE SYNC TEST] This is from the EDITED source file - if you see this, code sync works!")
-
         embedding_layer = self.model.get_input_embeddings()
         if embedding_layer is None:
             raise RuntimeError("Underlying model does not expose input embeddings.")
@@ -475,13 +472,8 @@ class HFModelWrapper(nn.Module):
                 )
             samples_metadata.append(meta)
 
-        # Check if we have plans (plans should be created during rollout generation)
         has_plans = any(meta.plans for meta in samples_metadata)
-        has_payloads = any(meta.payloads for meta in samples_metadata)
-        logger.info(f"[MODALITY CHECK] has_plans={has_plans}, has_payloads={has_payloads}")
-
         if not has_plans:
-            logger.warning(f"[MODALITY CHECK] No plans found, returning base_embeddings")
             return base_embeddings, modalities_metadata
 
         # Ensure embedding_spans are computed from actual input_ids.
@@ -502,19 +494,13 @@ class HFModelWrapper(nn.Module):
             update_metadata=update_metadata,
         )
 
-        logger.info(f"[PREPARE_EMBEDS] Called prepare_inputs_embeds, replacements: {len(replacements) if replacements else 0} samples")
         if not replacements:
-            logger.info(f"[PREPARE_EMBEDS] No replacements, returning base_embeddings directly")
             return base_embeddings, modalities_metadata
 
-        logger.info(f"[PREPARE_EMBEDS] Processing {len(replacements)} samples with modality replacements")
         seq_len = base_embeddings.size(1)
         hidden_size = base_embeddings.size(2)
 
-        # DIAGNOSTIC: Check base_embeddings
-        logger.info(f"[BASE_EMBEDDINGS] requires_grad={base_embeddings.requires_grad}, grad_fn={base_embeddings.grad_fn}, shape={base_embeddings.shape}")
-
-        # FSDP2: Check if we're working with DTensors
+        # Check if we're working with DTensors (FSDP2)
         try:
             from torch.distributed.tensor import DTensor
         except ImportError:
@@ -525,18 +511,13 @@ class HFModelWrapper(nn.Module):
 
         is_dtensor = DTensor is not None and isinstance(base_embeddings, DTensor)
 
-        # FSDP2: Convert DTensor to local before loop to avoid repeated conversions
         base_embeddings_local = base_embeddings
         mesh = None
         placements = None
         if is_dtensor:
-            logger.info(f"[DTENSOR DEBUG] base_embeddings IS DTensor, converting to local")
             mesh = base_embeddings.device_mesh
             placements = base_embeddings.placements
             base_embeddings_local = base_embeddings.to_local()
-            logger.info(f"[DTENSOR DEBUG] Converted to local, type: {type(base_embeddings_local)}")
-        else:
-            logger.info(f"[DTENSOR DEBUG] base_embeddings is regular Tensor: {type(base_embeddings_local)}")
 
         # Validate and convert all replacement tensors first
         validated_replacements = {}
@@ -564,7 +545,7 @@ class HFModelWrapper(nn.Module):
                         f"Projected embedding hidden size mismatch: expected {hidden_size}, got {tensor.shape[1]}."
                     )
 
-                # FSDP2: Convert modality tensor to local if it's a DTensor
+                # Convert modality tensor to local if it's a DTensor
                 if DTensor is not None and isinstance(tensor, DTensor):
                     tensor = tensor.to_local()
 
@@ -574,66 +555,32 @@ class HFModelWrapper(nn.Module):
             validated_spans.sort(key=lambda x: x[0][0])
             validated_replacements[sample_idx] = validated_spans
 
-        # Build embeddings per-sample using concatenation to PRESERVE GRADIENTS
-        # This fixes the gradient flow issue - torch.cat preserves grad_fn from modality tensors
+        # Build embeddings per-sample using torch.cat to preserve gradient flow
+        # from trainable modality embeddings (in-place assignment would break gradients)
         updated_embeddings_list = []
         for sample_idx in range(batch_size):
             parts = []
             last_pos = 0
 
-            # Get replacement spans for this sample
-            span_list = validated_replacements.get(sample_idx, [])
-
-            for span_idx, ((start, end), tensor) in enumerate(span_list):
-                # Add base embeddings before this modality span
+            for (start, end), tensor in validated_replacements.get(sample_idx, []):
                 if start > last_pos:
-                    base_part = base_embeddings_local[sample_idx, last_pos:start, :]
-                    parts.append(base_part)
-
-                # DIAGNOSTIC: Check modality tensor before cat
-                if span_idx == 0:  # Log first span only to avoid spam
-                    logger.info(f"[MODALITY TENSOR] Sample {sample_idx}, span {span_idx}: requires_grad={tensor.requires_grad}, grad_fn={tensor.grad_fn}, shape={tensor.shape}")
-
-                # Add modality embeddings (has grad_fn if modality is trainable)
+                    parts.append(base_embeddings_local[sample_idx, last_pos:start, :])
                 parts.append(tensor)
                 last_pos = end
 
-            # Add remaining base embeddings after last span
             if last_pos < seq_len:
-                base_part = base_embeddings_local[sample_idx, last_pos:, :]
-                parts.append(base_part)
+                parts.append(base_embeddings_local[sample_idx, last_pos:, :])
 
-            # Concatenate all parts - this PRESERVES grad_fn from modality tensors!
             if parts:
-                # DIAGNOSTIC: Check parts before cat (first sample only)
-                if sample_idx == 0:
-                    logger.info(f"[BEFORE CAT] Sample {sample_idx}: {len(parts)} parts")
-                    for part_idx, part in enumerate(parts):
-                        logger.info(f"[BEFORE CAT] Part {part_idx}: requires_grad={part.requires_grad}, grad_fn={part.grad_fn}, shape={part.shape}")
-
                 sample_embeddings = torch.cat(parts, dim=0)
-
-                # DIAGNOSTIC: Check result after cat (first sample only)
-                if sample_idx == 0:
-                    logger.info(f"[AFTER CAT] Sample {sample_idx}: requires_grad={sample_embeddings.requires_grad}, grad_fn={sample_embeddings.grad_fn}")
             else:
                 sample_embeddings = base_embeddings_local[sample_idx]
 
             updated_embeddings_list.append(sample_embeddings)
 
-        # Stack into batch tensor - preserves grad_fn
         updated_embeddings = torch.stack(updated_embeddings_list, dim=0)
 
-        # DIAGNOSTIC: Check if grad_fn preserved
-        logger.info(f"[GRADIENT DEBUG] updated_embeddings.requires_grad: {updated_embeddings.requires_grad}")
-        logger.info(f"[GRADIENT DEBUG] updated_embeddings.grad_fn: {updated_embeddings.grad_fn}")
-        if updated_embeddings.grad_fn is None:
-            logger.error(f"[GRADIENT DEBUG] STILL NO GRAD_FN after torch.cat fix!")
-            # Check individual samples
-            for idx, sample_emb in enumerate(updated_embeddings_list[:2]):  # Check first 2
-                logger.error(f"[GRADIENT DEBUG] Sample {idx}: requires_grad={sample_emb.requires_grad}, grad_fn={sample_emb.grad_fn}")
-
-        # FSDP2: Redistribute after building
+        # Redistribute after building
         if is_dtensor:
             from torch.distributed.tensor import distribute_tensor
             updated_embeddings = distribute_tensor(updated_embeddings, mesh, placements)

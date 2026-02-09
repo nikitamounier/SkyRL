@@ -742,37 +742,9 @@ class PolicyWorkerBase(Worker):
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
         rollout_action_logprobs = experience.rollout_logprobs
-        import sys
         modalities_metadata = None
-        # Check for memory documents at sample level
-        # Need to determine if batch has consistent gradient states for backward pass
-        has_any_memory_docs = False
-        all_samples_have_memory_docs = True
-        samples_with_memory = 0
-        samples_without_memory = 0
-
         if experience.metadata is not None:
             modalities_metadata = experience.metadata.get("modalities_metadata")
-            if modalities_metadata is not None:
-                # Scan ALL samples to determine batch composition
-                for idx, metadata in enumerate(modalities_metadata):
-                    sample_has_docs = False
-                    if metadata is not None and hasattr(metadata, 'payloads'):
-                        # Check if any modality has non-empty payloads
-                        for modality_id, payloads in metadata.payloads.items():
-                            if payloads and any(p for p in payloads if p):
-                                sample_has_docs = True
-                                has_any_memory_docs = True
-                                break
-
-                    if sample_has_docs:
-                        samples_with_memory += 1
-                    else:
-                        samples_without_memory += 1
-                        all_samples_have_memory_docs = False
-
-        sys.stderr.write(f"[BATCH] memory={samples_with_memory}/{samples_with_memory + samples_without_memory}\n")
-        sys.stderr.flush()
         supports_modalities = self._get_modalities_capable_module() is not None
 
         # TODO (sumanthrh): don't think this does anything for deepspeed or fsdp rn because autocast happens internally
@@ -823,9 +795,12 @@ class PolicyWorkerBase(Worker):
         loss = policy_loss + kl_loss * self.cfg.trainer.algorithm.kl_loss_coef
         loss = loss / accumulation_steps
 
-        # Always run backward. Mixed batches (some samples with memory, some without)
-        # work fine - gradients flow through samples that have memory embeddings.
-        self.strategy.backward(loss, self.model, self.optimizer)
+        # When the base model is frozen and no memory docs are in the batch,
+        # loss has no grad_fn (no trainable param contributed). Skip backward
+        # in that case — there's nothing to update. Mixed batches with at least
+        # one sample containing memory docs will have grad_fn and train normally.
+        if loss.grad_fn is not None:
+            self.strategy.backward(loss, self.model, self.optimizer)
 
         grad_norm = None
         if (local_step + 1) % accumulation_steps == 0:

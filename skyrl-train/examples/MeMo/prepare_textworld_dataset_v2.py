@@ -47,8 +47,7 @@ PROMPT_VARIANTS: Dict[str, Dict[str, str]] = {
             "You are an agent in a text adventure game.\n"
             "Think briefly, then ALWAYS end with exactly one action line in this format:\n"
             "[ACTION: <command>]\n"
-            "Use short game commands (look, inventory, examine, take, open, close, go north, etc.).\n"
-            "Memory slots from prior turns:\n{memory_slots}"
+            "Use short game commands (look, inventory, examine, take, open, close, go north, etc.)."
         ),
         "user": "Start the game and choose the next best action.",
     },
@@ -56,16 +55,14 @@ PROMPT_VARIANTS: Dict[str, Dict[str, str]] = {
         "system": (
             "You play TextWorld efficiently.\n"
             "Use memory summaries when useful and avoid repeating failed actions.\n"
-            "Return one final action command in the format [ACTION: <command>].\n"
-            "Memory slots:\n{memory_slots}"
+            "Return one final action command in the format [ACTION: <command>]."
         ),
         "user": "What is your next action?",
     },
     "v3_compact": {
         "system": (
             "Solve the game step by step.\n"
-            "Output must end with [ACTION: <command>].\n"
-            "Memory:\n{memory_slots}"
+            "Output must end with [ACTION: <command>]."
         ),
         "user": "Play optimally.",
     },
@@ -73,8 +70,7 @@ PROMPT_VARIANTS: Dict[str, Dict[str, str]] = {
         "system": (
             "You are playing a text-based game.\n"
             "Final line must be parseable as [ACTION: ...] with only a single command.\n"
-            "Do not output multiple actions.\n"
-            "Memory context:\n{memory_slots}"
+            "Do not output multiple actions."
         ),
         "user": "Continue the game.",
     },
@@ -130,28 +126,22 @@ def _choose_weighted_label(
     return labels_in_order[-1]
 
 
-def _build_memory_slots(placeholder_token: str, max_memory_docs: int) -> str:
-    return " ".join([placeholder_token] * max_memory_docs)
-
-
 def _build_prompt(
     *,
     prompt_variant_id: str,
     placeholder_token: str,
     max_memory_docs: int,
 ) -> List[Dict[str, str]]:
+    """Build initial prompt. No placeholder tokens — they are injected on-the-fly
+    by the SkyRL generator as memory documents appear during episode rollout."""
     if prompt_variant_id not in PROMPT_VARIANTS:
         raise ValueError(
             f"Unknown prompt_variant_id `{prompt_variant_id}`. "
             f"Choices: {sorted(PROMPT_VARIANTS.keys())}"
         )
     template = PROMPT_VARIANTS[prompt_variant_id]
-    memory_slots = _build_memory_slots(placeholder_token, max_memory_docs)
     return [
-        {
-            "role": "system",
-            "content": template["system"].format(memory_slots=memory_slots),
-        },
+        {"role": "system", "content": template["system"]},
         {"role": "user", "content": template["user"]},
     ]
 

@@ -116,6 +116,8 @@ class TextWorldEnv(BaseTextEnv):
         self.max_memory_docs = int(extras.get("max_memory_docs") or env_config.get("max_memory_docs", 4))
         self.max_doc_tokens = int(extras.get("max_doc_tokens") or env_config.get("max_doc_tokens", 256))
         self.tokenizer_path = str(extras.get("tokenizer_path") or env_config.get("tokenizer_path", ""))
+        self.step_penalty = float(extras.get("step_penalty") or env_config.get("step_penalty", 0.0))
+        self.efficiency_bonus = float(extras.get("efficiency_bonus") or env_config.get("efficiency_bonus", 0.0))
 
         self.modality_id = str(extras.get("memory_modality_id") or env_config.get("memory_modality_id", "memo_memory"))
         self.placeholder_token = str(extras.get("placeholder_token") or env_config.get("placeholder_token", "<|image_pad|>"))
@@ -223,34 +225,29 @@ class TextWorldEnv(BaseTextEnv):
         from skyrl_train.dataset.modalities import ModalityPlaceholderPlan
 
         if documents:
-            # Encode each document to token IDs
-            payloads: List[List[int]] = []
-            for doc in documents:
-                payloads.append(self._encode_document(doc))
+            # Bundle ALL documents as a single payload so the Memory module
+            # receives [1, num_docs, 2560] — matching the MeMo reference where
+            # cross-attention operates over multiple document embeddings.
+            docs_with_content = [doc for doc in documents if doc]
 
-            num_docs_with_content = sum(1 for p in payloads if p)
-
-            # Dynamically inject placeholder tokens into the system message
-            # so the modalities framework can find and replace them.
-            if self._system_message is not None and num_docs_with_content > 0:
-                per_doc_block = " ".join(
+            if self._system_message is not None and docs_with_content:
+                # Single block of 8 placeholder tokens for all documents combined
+                placeholder_block = " ".join(
                     [self.placeholder_token] * self.max_placeholder_tokens
                 )
-                placeholder_text = "\n".join(
-                    per_doc_block for _ in range(num_docs_with_content)
-                )
                 self._system_message["content"] = (
-                    f"{self._base_system_content}\n{placeholder_text}"
+                    f"{self._base_system_content}\n{placeholder_block}"
                 )
 
-            modalities_entry.payloads[self.modality_id] = payloads
+            # Single occurrence containing all documents as one payload
+            modalities_entry.payloads[self.modality_id] = [docs_with_content] if docs_with_content else []
 
             plan = ModalityPlaceholderPlan(
                 modality_id=self.modality_id,
                 placeholder_token=self.placeholder_token,
-                occurrences=num_docs_with_content,
-                reserved_tokens=[self.max_placeholder_tokens] * num_docs_with_content,
-                payload=payloads[:num_docs_with_content],
+                occurrences=1 if docs_with_content else 0,
+                reserved_tokens=[self.max_placeholder_tokens] if docs_with_content else [],
+                payload=[docs_with_content] if docs_with_content else [],
             )
             modalities_entry.plans[self.modality_id] = plan
         else:
@@ -279,6 +276,17 @@ class TextWorldEnv(BaseTextEnv):
         env = self._get_env()
         self._game_state, reward, done = env.step(parsed_action)
         score = getattr(self._game_state, "score", 0)
+
+        # Step-efficiency reward shaping:
+        #   step_penalty: small negative reward each turn (encourages faster solving)
+        #   efficiency_bonus: bonus when winning, scaled by how early (1.0 at turn 1, 0.0 at max_turns)
+        shaped_reward = float(reward)
+        if self.step_penalty > 0:
+            shaped_reward -= self.step_penalty
+        if done and getattr(self._game_state, "won", False) and self.efficiency_bonus > 0:
+            efficiency = max(0.0, 1.0 - (self.turns / self.max_turns))
+            shaped_reward += self.efficiency_bonus * efficiency
+        reward = shaped_reward
 
         self._memory.add_turn(
             turn=self.turns,
