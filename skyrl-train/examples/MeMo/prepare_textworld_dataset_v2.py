@@ -41,38 +41,59 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyPreset] = {
 }
 
 
+TEXTWORLD_COMMANDS = (
+    "Valid commands:\n"
+    "  Navigation: go north, go south, go east, go west\n"
+    "  Items: take <item>, drop <item>, inventory, look\n"
+    "  Interact: open <container>, close <container>, examine <object>\n"
+    "  Keys: unlock <thing> with <key>, lock <thing> with <key>\n"
+    "  Place: put <item> on <surface>, insert <item> into <container>"
+)
+
 PROMPT_VARIANTS: Dict[str, Dict[str, str]] = {
-    "v1_strict_action": {
+    "v1_full": {
         "system": (
-            "You are an agent in a text adventure game.\n"
-            "Think briefly, then ALWAYS end with exactly one action line in this format:\n"
+            "You are playing a TextWorld text adventure game. The objective was stated at the "
+            "start of the game — follow those instructions step by step.\n\n"
+            f"{TEXTWORLD_COMMANDS}\n\n"
+            "Think about what you need to do next, then end your response with exactly one action:\n"
             "[ACTION: <command>]\n"
-            "Use short game commands (look, inventory, examine, take, open, close, go north, etc.)."
+            "Only the text inside [ACTION: ...] is sent to the game."
         ),
-        "user": "Start the game and choose the next best action.",
+        "user": "You are in a text adventure game. Read the observation and decide your next action.",
     },
-    "v2_memory_first": {
+    "v2_memory": {
         "system": (
-            "You play TextWorld efficiently.\n"
-            "Use memory summaries when useful and avoid repeating failed actions.\n"
-            "Return one final action command in the format [ACTION: <command>]."
+            "You are playing a TextWorld game. You have compressed memory of previous turns "
+            "injected into this conversation. Use it to remember rooms visited, items found, "
+            "and which actions worked or failed.\n\n"
+            f"{TEXTWORLD_COMMANDS}\n\n"
+            "Reason briefly about your situation, then output:\n"
+            "[ACTION: <command>]"
         ),
-        "user": "What is your next action?",
+        "user": "Based on the observation and your memory, what is your next action?",
     },
-    "v3_compact": {
+    "v3_strategic": {
         "system": (
-            "Solve the game step by step.\n"
-            "Output must end with [ACTION: <command>]."
+            "You are an expert TextWorld player. Your task was described at the start of the game.\n\n"
+            f"{TEXTWORLD_COMMANDS}\n\n"
+            "Strategy:\n"
+            "- Start with 'look' and 'inventory' to understand your situation\n"
+            "- Examine objects and containers before moving on\n"
+            "- Pick up keys and items — you'll need them later\n"
+            "- Track which rooms you've visited to avoid going in circles\n"
+            "- Follow the objective step by step\n\n"
+            "End every response with [ACTION: <command>]"
         ),
-        "user": "Play optimally.",
+        "user": "What should you do next to make progress toward your goal?",
     },
-    "v4_safety_parseable": {
+    "v4_concise": {
         "system": (
-            "You are playing a text-based game.\n"
-            "Final line must be parseable as [ACTION: ...] with only a single command.\n"
-            "Do not output multiple actions."
+            "TextWorld game. Follow the objective from the first observation.\n"
+            f"{TEXTWORLD_COMMANDS}\n"
+            "Output: [ACTION: <command>]"
         ),
-        "user": "Continue the game.",
+        "user": "Next action?",
     },
 }
 

@@ -58,7 +58,7 @@ python skyrl-train/examples/MeMo/prepare_textworld_dataset_v2.py \
   --seed "$SEED" \
   --train_ratio 0.85 \
   --val_ratio 0.10 \
-  --prompt_variants "v1_strict_action,v2_memory_first,v3_compact,v4_safety_parseable" \
+  --prompt_variants "v1_full,v2_memory,v3_strategic,v4_concise" \
 
 echo "========================================="
 echo "Dataset generation complete"

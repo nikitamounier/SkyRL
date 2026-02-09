@@ -717,12 +717,12 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
             memory_init=memory_init,
         )
 
-        # Zero-init the output projection so the Memory module starts by
-        # producing zero embeddings. This prevents the catastrophic gradient
-        # explosion on step 1 — the LLM sees zeros (like padding) instead of
-        # random garbage. Training gradually learns to produce useful outputs.
+        # Small-scale init the output projection to prevent step-1 gradient
+        # explosion. Pure zeros would make memory invisible (no grad_fn → no
+        # backward). Small random values (~0.01 scale) produce small non-zero
+        # outputs that create gradient signal without destabilizing the LLM.
         if hasattr(self.memory, 'memory_projection'):
-            nn.init.zeros_(self.memory.memory_projection.weight)
+            nn.init.normal_(self.memory.memory_projection.weight, mean=0.0, std=0.01)
             if self.memory.memory_projection.bias is not None:
                 nn.init.zeros_(self.memory.memory_projection.bias)
 

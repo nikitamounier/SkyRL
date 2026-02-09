@@ -49,6 +49,13 @@ uv.lock
 *.md
 *.err
 *.out
-
+*.png
+*.log
 *.txt
+*.qzl
+chaos_log_*
+
+# Exceptions: track these specific files
+!docs/MeMo_TextWorld_Status.md
+!TODO.md
 
