@@ -9,21 +9,16 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt, EmbedsPrompt
-from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-from vllm.entrypoints.openai.models.protocol import BaseModelPath
-from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.chat_completion.protocol import (
+from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
-)
-from vllm.entrypoints.openai.completion.protocol import (
-    CompletionRequest,
-    CompletionResponse,
-)
-from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     ErrorInfo,
+    CompletionRequest,
+    CompletionResponse,
 )
 from vllm.lora.request import LoRARequest
 from torch.distributed import destroy_process_group
@@ -662,11 +657,12 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         model_name = model_path
 
         base_model_paths = [BaseModelPath(name=model_name, model_path=model_path)]
-        models = OpenAIServingModels(engine, base_model_paths)
+        models = OpenAIServingModels(engine, model_config, base_model_paths)
         # TODO(Charlie): revisit kwargs `enable_auto_tools` and `tool_parser` when we need to
         # support OAI-style tool calling; and `request_logger` for better debugging.
         self.openai_serving_chat = OpenAIServingChat(
             engine_client=engine,
+            model_config=model_config,
             models=models,
             response_role="assistant",
             request_logger=None,
@@ -679,6 +675,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # `enable_prompt_tokens_details`, `enable_force_include_usage`.
         self.openai_serving_completion = OpenAIServingCompletion(
             engine_client=engine,
+            model_config=model_config,
             models=models,
             request_logger=None,
         )

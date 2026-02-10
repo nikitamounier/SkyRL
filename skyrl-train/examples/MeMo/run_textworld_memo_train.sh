@@ -33,6 +33,7 @@ RESUME_MODE="${RESUME_MODE:-null}"
 ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
 N_SAMPLES="${N_SAMPLES:-5}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
+MEMORY_CHECKPOINT="${MEMORY_CHECKPOINT:-}"
 
 # Load W&B API key from file if not set
 if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.wandb_api_key" ]]; then
@@ -51,7 +52,7 @@ fi
 # --- Launch training ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKYRL_TRAIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-source "$SKYRL_TRAIN_ROOT/.venv/bin/activate"
+# Use whatever env the slurm script activated (skyenv or .venv)
 
 python -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
@@ -91,7 +92,7 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.policy_mini_batch_size=4 \
   trainer.micro_forward_batch_size_per_gpu=2 \
   trainer.micro_train_batch_size_per_gpu=2 \
-  trainer.ckpt_interval=50 \
+  trainer.ckpt_interval=500 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.max_input_length=$MAX_PROMPT_LENGTH \
   trainer.policy.optimizer_config.lr=$LR \
@@ -100,7 +101,7 @@ python -m skyrl_train.entrypoints.main_base \
   generator.run_engines_locally=true \
   generator.weight_sync_backend=nccl \
   generator.async_engine=true \
-  generator.gpu_memory_utilization=0.8 \
+  generator.gpu_memory_utilization=${GPU_MEM_UTIL:-0.5} \
   +generator.engine_init_kwargs.max_model_len=4224 \
   trainer.logger="$LOGGER" \
   trainer.project_name="textworld_memo" \
@@ -118,8 +119,10 @@ python -m skyrl_train.entrypoints.main_base \
   +modalities.memo_memory.encoder.kwargs.num_layers=1 \
   +modalities.memo_memory.encoder.kwargs.dropout=0.1 \
   +modalities.memo_memory.encoder.kwargs.memory_init="xavier_uniform" \
-  +modalities.memo_memory.encoder.kwargs.embedding_device="cpu" \
+  +modalities.memo_memory.encoder.kwargs.embedding_device="${EMBEDDING_DEVICE:-cuda}" \
   +modalities.memo_memory.encoder.kwargs.memo_repo_root="$MEMO_REPO_ROOT" \
+  ${MEMORY_CHECKPOINT:++modalities.memo_memory.encoder.kwargs.checkpoint_path="$MEMORY_CHECKPOINT"} \
+  ${MEMORY_CHECKPOINT:++modalities.memo_memory.encoder.kwargs.checkpoint_prefix=""} \
   +modalities.memo_memory.projection.target="skyrl_train.examples.modalities.memo_handlers:IdentityProjection" \
   +modalities.memo_memory.projection.kwargs={} \
   +modalities.memo_memory.trainable.encoder=true \

@@ -24,7 +24,6 @@ cd "${SLURM_SUBMIT_DIR:-$HOME/SkyRL}"
 
 export SKYRL_REPO_ROOT="${SKYRL_REPO_ROOT:-$HOME/SkyRL}"
 source "${SKYRL_REPO_ROOT}/skyrl-train/.venv/bin/activate"
-export RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook
 
 DATA_DIR="${DATA_DIR:-$HOME/data/textworld_memo}"
 CKPT_DIR="${CKPT_DIR:-/large_storage/goodarzilab/parsaidp/MeMo/ckpts/textworld_memo}"
@@ -37,6 +36,7 @@ STEP_PENALTY="${STEP_PENALTY:-0.0}"
 EFFICIENCY_BONUS="${EFFICIENCY_BONUS:-0.0}"
 ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
 N_SAMPLES="${N_SAMPLES:-5}"
+MEMORY_CHECKPOINT="${MEMORY_CHECKPOINT:-}"
 
 # Resolve model path: prefer local cache, fall back to HF repo id.
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
@@ -52,6 +52,7 @@ if [ ! -d "skyrl-train/skyrl-gym" ] && [ -d "skyrl-gym" ]; then
 fi
 
 unset RAY_ADDRESS
+export SKYRL_RAY_PG_TIMEOUT_IN_S=600
 mkdir -p "$CKPT_DIR"
 
 if [ ! -f "$DATA_DIR/train.parquet" ] || [ ! -f "$DATA_DIR/validation.parquet" ]; then
@@ -73,9 +74,10 @@ echo "  N_Samples:  $N_SAMPLES"
 echo "  StepPenalty: $STEP_PENALTY"
 echo "  EffBonus:   $EFFICIENCY_BONUS"
 echo "  Resume:     $RESUME_MODE"
+echo "  MemCkpt:   ${MEMORY_CHECKPOINT:-none}"
 echo "========================================="
 
-export DATA_DIR CKPT_DIR NUM_GPUS LOGGER MODEL_PATH MEMORY_DIM MEMORY_WINDOW STEP_PENALTY EFFICIENCY_BONUS LR ADVANTAGE_ESTIMATOR N_SAMPLES
+export DATA_DIR CKPT_DIR NUM_GPUS LOGGER MODEL_PATH MEMORY_DIM MEMORY_WINDOW STEP_PENALTY EFFICIENCY_BONUS LR ADVANTAGE_ESTIMATOR N_SAMPLES MEMORY_CHECKPOINT
 export WANDB_ENTITY="${WANDB_ENTITY:-dsp-team}"
 
 if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.wandb_api_key" ]]; then
@@ -85,7 +87,8 @@ fi
 cd skyrl-train
 bash examples/MeMo/run_textworld_memo_train.sh \
   trainer.epochs="$EPOCHS" \
-  trainer.resume_mode="$RESUME_MODE"
+  trainer.resume_mode="$RESUME_MODE" \
+  "$@"
 
 echo "========================================="
 echo "Training completed. Checkpoints: $CKPT_DIR"

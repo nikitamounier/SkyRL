@@ -25,6 +25,7 @@ cd "${SLURM_SUBMIT_DIR:-$HOME/SkyRL}"
 
 export SKYRL_REPO_ROOT="${SKYRL_REPO_ROOT:-$HOME/SkyRL}"
 source "${SKYRL_REPO_ROOT}/skyrl-train/.venv/bin/activate"
+export PYTHONUNBUFFERED=1
 
 DATA_DIR="${DATA_DIR:-$HOME/data/textworld_memo}"
 DATA_FILE="${DATA_FILE:-$DATA_DIR/test.parquet}"

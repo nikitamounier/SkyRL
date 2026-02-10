@@ -22,6 +22,7 @@ echo "  Windows:   3, 5, 10"
 echo "  LR:        $LR"
 echo "  Encoder:   MemoSentenceEmbeddingEncoder (Qwen3-Embedding-4B)"
 echo "  Reward:    step_penalty=0.01, eff_bonus=1.0"
+echo "  MemCkpt:  ${MEMORY_CHECKPOINT:-none}"
 echo "========================================="
 echo ""
 
@@ -37,6 +38,7 @@ for ADV in grpo "reinforce++"; do
       STEP_PENALTY=0.01 \
       EFFICIENCY_BONUS=1.0 \
       MEMORY_WINDOW=$MW \
+      ${MEMORY_CHECKPOINT:+MEMORY_CHECKPOINT="$MEMORY_CHECKPOINT"} \
       RUN_NAME="$NAME" \
       CKPT_DIR="${CKPT_BASE}/${NAME}" \
       sbatch -p "$PARTITION" -t "$TIME" \

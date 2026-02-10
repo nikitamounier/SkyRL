@@ -767,69 +767,85 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
             )
             filtered = state_dict
         missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
+        total_params = len(list(self.memory.state_dict().keys()))
+        loaded_params = total_params - len(missing)
+        logger.info(
+            "Checkpoint %s: loaded %d/%d params (missing=%d, unexpected=%d)",
+            checkpoint_path, loaded_params, total_params, len(missing), len(unexpected),
+        )
         if missing:
             logger.warning("Missing keys when loading memory checkpoint: %s", missing)
         if unexpected:
             logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
+        if loaded_params == 0:
+            logger.error(
+                "NO parameters loaded from checkpoint! Check checkpoint_prefix (got '%s') "
+                "and checkpoint key format.", prefix,
+            )
 
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
-        """Encode payloads into memory tokens.
+        """Encode payloads into memory tokens (batched).
 
-        Each payload is a list of document texts (all docs for one game).
-        We embed all docs with SentenceTransformer, stack to [1, num_docs, 2560],
-        and pass through the Memory module's cross-attention to produce
-        [num_memories, output_dim] — matching the MeMo reference architecture.
+        Batch-embeds all docs in one SentenceTransformer call, then runs
+        a single padded Memory module forward pass.
         """
-        outputs: List[torch.Tensor] = []
         ref_param = next(self.memory.parameters(), None)
         device = ref_param.device if ref_param is not None else torch.device("cpu")
         dtype = ref_param.dtype if ref_param is not None else torch.bfloat16
 
-        for idx, payload in enumerate(payloads):
+        # Phase 1: resolve texts per payload
+        all_texts: List[str] = []
+        doc_counts: List[int] = []
+        for payload in payloads:
             texts = self._resolve_texts(payload)
-            if not texts:
-                outputs.append(torch.zeros(self.num_memories, self.output_dim, device=device, dtype=dtype))
-                continue
+            doc_counts.append(len(texts))
+            all_texts.extend(texts)
 
-            # Embed ALL documents with SentenceTransformer (frozen, on CPU)
+        # Phase 2: single batched SentenceTransformer encode
+        all_embeddings = None
+        if all_texts:
             model = self._get_embedding_model()
             with torch.no_grad():
-                embeddings = model.encode(
-                    texts,
-                    convert_to_numpy=False,
-                    show_progress_bar=False,
+                raw = model.encode(
+                    all_texts, convert_to_numpy=False,
+                    show_progress_bar=False, device=self._embedding_device,
                 )
-            # embeddings: either a single tensor [num_docs, dim] or a list of tensors
-            if isinstance(embeddings, torch.Tensor):
-                doc_embeds = embeddings.to(device=device, dtype=dtype)
-            elif isinstance(embeddings, (list, tuple)):
-                doc_embeds = torch.stack([
+            if isinstance(raw, torch.Tensor):
+                all_embeddings = raw.to(device=device, dtype=dtype)
+            elif isinstance(raw, (list, tuple)):
+                all_embeddings = torch.stack([
                     t.to(device=device, dtype=dtype) if isinstance(t, torch.Tensor)
-                    else torch.tensor(t, device=device, dtype=dtype)
-                    for t in embeddings
+                    else torch.tensor(t, device=device, dtype=dtype) for t in raw
                 ])
             else:
-                doc_embeds = torch.tensor(embeddings, device=device, dtype=dtype)
+                all_embeddings = torch.tensor(raw, device=device, dtype=dtype)
 
-            if doc_embeds.dim() == 1:
-                doc_embeds = doc_embeds.unsqueeze(0)  # [1, embedding_dim]
+        # Phase 3: batched Memory forward with padding
+        non_empty = [(i, dc) for i, dc in enumerate(doc_counts) if dc > 0]
+        max_docs = max(doc_counts) if doc_counts else 0
+        outputs: List[torch.Tensor] = [
+            torch.zeros(self.num_memories, self.output_dim, device=device, dtype=dtype)
+            for _ in payloads
+        ]
+        if not non_empty or max_docs == 0 or all_embeddings is None:
+            return outputs
 
-            # Reshape to [1, num_docs, embedding_dim] for Memory module
-            doc_embeds = doc_embeds.unsqueeze(0).detach()  # [1, num_docs, 2560]
+        B = len(non_empty)
+        batch_embeds = torch.zeros(B, max_docs, self.embedding_dim, device=device, dtype=dtype)
+        padding_mask = torch.ones(B, max_docs, dtype=torch.bool, device=device)
+        offset = 0
+        idx_map: List[int] = []
+        for batch_pos, (orig_idx, dc) in enumerate(non_empty):
+            batch_embeds[batch_pos, :dc] = all_embeddings[offset:offset + dc]
+            padding_mask[batch_pos, :dc] = False
+            offset += dc
+            idx_map.append(orig_idx)
 
-            # Memory module forward pass — cross-attention over all documents
-            # 8 queries attend to num_docs positions, producing diverse outputs
-            with torch.enable_grad():
-                memory_embeddings, _ = self.memory(doc_embeds, padding_mask=None)
+        with torch.enable_grad():
+            memory_out, _ = self.memory(batch_embeds.detach(), padding_mask=padding_mask)
 
-            expected_shape = (1, self.num_memories, self.output_dim)
-            if memory_embeddings.shape != expected_shape:
-                raise RuntimeError(
-                    f"Sample {idx}: Memory module returned {tuple(memory_embeddings.shape)}, "
-                    f"expected {expected_shape}"
-                )
-
-            outputs.append(memory_embeddings.squeeze(0).to(dtype=dtype))
+        for batch_pos, orig_idx in enumerate(idx_map):
+            outputs[orig_idx] = memory_out[batch_pos].to(dtype=dtype)
 
         return outputs
 

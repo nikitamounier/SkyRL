@@ -87,13 +87,97 @@ Qwen3-4B-Instruct (frozen LLM) sees: [text embeddings ... memory embeddings ... 
 ### Key Finding
 Qwen3-4B spams `[ACTION: move south]` (wrong syntax -- TextWorld needs `go south`) for 50 turns straight. It doesn't understand TextWorld commands or follow objectives. GPT-5-mini reasons step-by-step and solves games in 8-14 turns. **Memory can't fix a model that doesn't know how to play.**
 
-### RL Training Results (20 runs, Feb 8-9)
+### Memory Eval Results (Feb 10)
 
-**All runs trend DOWN over 50+ steps.** The small-init (std=0.01) fixed gradient flow (no more nan), but the memory module learns to produce outputs that hurt rather than help.
+Evaluated with proper embedding injection (SentenceTransformer + EmbedsPrompt). Eval script: `eval_textworld_memory.py`. Three conditions: no memory, random (untrained) memory, and SFT-trained memory.
+
+**Test Set (20 games)**:
+| Config | Solve Rate | Medium (2) | Hard (18) |
+|--------|-----------|-----------|----------|
+| Random w3 | **7/20 (35.0%)** | 1/2 (50%) | 6/18 (33.3%) |
+| Random w5 | 6/20 (30.0%) | 1/2 (50%) | 5/18 (27.8%) |
+| Random w10 | 6/20 (30.0%) | 1/2 (50%) | 5/18 (27.8%) |
+| No Memory (baseline) | 5/20 (25.0%) | -- | -- |
+| SFT w10 | 5/20 (25.0%) | 1/2 (50%) | 4/18 (22.2%) |
+| SFT w3 | 4/20 (20.0%) | 1/2 (50%) | 3/18 (16.7%) |
+| SFT w5 | 4/20 (20.0%) | 1/2 (50%) | 3/18 (16.7%) |
+| **GPT-5-mini** | **15/20 (75.0%)** | -- | -- |
+
+**Validation Set (40 games)**:
+| Config | Solve Rate | Medium (18) | Hard (22) |
+|--------|-----------|------------|----------|
+| **Random w3** | **23/40 (57.5%)** | 16/18 (88.9%) | 7/22 (31.8%) |
+| No Memory (baseline) | 20/40 (50.0%) | -- | -- |
+| Random w10 | 19/40 (47.5%) | 11/18 (61.1%) | 8/22 (36.4%) |
+| Random w5 | 17/40 (42.5%) | 11/18 (61.1%) | 6/22 (27.3%) |
+| SFT w5 | 15/40 (37.5%) | 11/18 (61.1%) | 4/22 (18.2%) |
+| SFT w10 | 15/40 (37.5%) | 10/18 (55.6%) | 5/22 (22.7%) |
+| SFT w3 | 12/40 (30.0%) | 10/18 (55.6%) | 2/22 (9.1%) |
+
+**Train Set (340 games)**:
+| Config | Solve Rate | Medium (91) | Hard (249) |
+|--------|-----------|------------|----------|
+| **Random w10** | **131/340 (38.5%)** | 46/91 (50.5%) | 85/249 (34.1%) |
+| Random w5 | 124/340 (36.5%) | 44/91 (48.4%) | 80/249 (32.1%) |
+| Random w3 | 116/340 (34.1%) | 44/91 (48.4%) | 72/249 (28.9%) |
+| SFT w10 | 100/340 (29.4%) | 39/91 (42.9%) | 61/249 (24.5%) |
+| SFT w5 | 99/340 (29.1%) | 38/91 (41.8%) | 61/249 (24.5%) |
+| No Memory (baseline) | 90/340 (26.5%) | -- | -- |
+| SFT w3 | 81/340 (23.8%) | 35/91 (38.5%) | 46/249 (18.5%) |
+
+### Key Findings
+
+1. **Random memory consistently outperforms SFT memory** across all splits and all window sizes. On the train set, random w10 achieves 38.5% vs SFT w10's 29.4% — a 9-point gap.
+2. **Random memory also beats no-memory baseline** on test (+5-10%) and train (+8-12%), suggesting the embedding injection architecture itself provides benefit even without training.
+3. **SFT training actively hurts** — it pushes memory weights in a direction that confuses Qwen3-4B. The memory module learned to optimize for GPT-5-mini's expert actions, but Qwen3-4B can't interpret those signals. The SFT weights moved from init (verified: avg param diff=0.013, 21 parameters changed) but in an unhelpful direction.
+4. **On validation, even random memory is mixed** — random w3 beats baseline (57.5% vs 50%) but random w5 drops below (42.5%). Small sample sizes (40 games) add noise.
+5. **Larger windows help on train** (random w10=38.5% > w3=34.1%) but this reverses on val/test, suggesting overfitting to longer game patterns.
+
+**Implication**: RL fine-tuning directly on Qwen3-4B's own gameplay is the correct approach — the memory module must learn embeddings that help THIS model, not embeddings optimized for GPT-5-mini.
+
+### RL Training Results — Phase 2 (12 runs, SFT warm-start, Feb 10, IN PROGRESS)
+
+| Run | Sched | Steps | First3 R | Last3 R | Trend | Grad Norm | Entropy |
+|-----|-------|-------|----------|---------|-------|-----------|---------|
+| **GRPO w10 const** | const | 101 | 0.193 | 0.405 | **UP** | 151 !! | 0.001 |
+| **R++ w5 cosine** | cosine | 50 | 0.238 | 0.424 | **UP** | 4.48 | 0.117 |
+| **GRPO w10 cosine** | cosine | 56 | 0.267 | 0.421 | **UP** | 236 !! | 5.875 |
+| R++ w3 const | const | 72 | 0.074 | 0.339 | UP | 132 !! | 0.283 |
+| GRPO w5 cosine | cosine | 50 | 0.279 | 0.302 | FLAT | 13.75 | 0.365 |
+| R++ w10 const | const | 101 | 0.287 | 0.299 | FLAT | 1.6M !! | 0.332 |
+| GRPO w3 cosine | cosine | 42 | 0.171 | 0.273 | UP | 0.03 | 0.126 |
+| R++ w3 cosine | cosine | 42 | 0.167 | 0.218 | UP | 4.74 | 0.162 |
+| R++ w5 const | const | 26 | 0.225 | 0.132 | DOWN | 0.17 | 0.166 |
+| GRPO w5 const | const | 86 | 0.309 | 0.100 | DOWN | 1150 !! | 0.287 |
+| GRPO w3 const | const | 45 | 0.186 | -0.027 | DOWN | 11.93 | 0.393 |
+| R++ w10 cosine | cosine | 61 | 0.191 | 0.085 | DOWN | 5.72 | 0.124 |
+
+**Observations**:
+- 7/12 runs trending UP or FLAT — much better than Phase 1 (where nearly all trended DOWN)
+- **Gradient explosion** is the main failure mode: R++ w10 const (1.6M), GRPO w5 const (1150), GRPO w10 cosine (236)
+- **Cosine scheduler** produces more stable gradients overall (GRPO w3 cosine grad=0.03 vs const grad=12)
+- **GRPO w10 const** has highest reward (0.405) but entropy collapsed to 0.001 — model becoming deterministic
+- **R++ w5 cosine** is the healthiest run: reward UP (0.42), stable grads (4.48), reasonable entropy (0.117)
+
+### RL Training Results — Phase 1 (20 runs, 78-165 steps each, Feb 8-9, no SFT warm-start)
+
+**Nearly all runs trend DOWN over 50+ steps.** Small-init fixed gradient flow, but memory outputs hurt the LLM rather than help. Only 1 run showed slight improvement:
+
+| Run | Steps | First10 R | Last10 R | Trend | Notes |
+|-----|-------|-----------|----------|-------|-------|
+| **R++ w5** | **137** | **0.45** | **0.55** | **UP** | **Only improving run** |
+| R++ w5 cosine | 137 | 0.44 | 0.42 | FLAT | |
+| GRPO w3 | 78 | 0.45 | 0.41 | FLAT | |
+| R++ w5 lr5e5 | 139 | 0.56 | 0.41 | DOWN | |
+| GRPO w10 | 106 | 0.52 | 0.18 | DOWN | Entropy=7.8 (exploded) |
+| R++ w10 | 165 | 0.51 | 0.02 | DOWN | Most steps, still declining |
+| GRPO w5 | 92 | 0.50 | 0.11 | DOWN | Entropy collapsed to 0.0 |
+
+(See `docs/rl_training_final.png` for reward curves)
 
 Best configs found (for future use after SFT):
-- **GRPO + w3**: Fast initial improvement, but unstable with larger windows
-- **REINFORCE++ + w10**: Most stable, slow convergence
+- **REINFORCE++ w5**: Only config that showed slight upward trend
+- **GRPO w3**: Most stable early, but flattens
 - **LR=1e-4**: Sweet spot. 5e-4 explodes, 5e-5 too slow
 - **n_samples=5**: 8 doesn't help. **t50 turns**: 100 doesn't help.
 
@@ -124,21 +208,23 @@ RL training from scratch fundamentally limited by:
 
 ## 5. Current Plan & TODO
 
-### Phase 1: Generate Expert Data -- IN PROGRESS
+### Phase 1: Generate Expert Data -- DONE
 - [x] GPT-5-mini test set: 20 games, 15 won (75%)
-- [ ] GPT-5-mini train set: 340 games x 3 samples = 1020 tasks (16 workers, ~89% win rate)
-- [ ] GPT-5-mini val set: 40 games x 3 samples = 120 tasks
+- [x] GPT-5-mini train set: 340 games x 3 samples (~89% win rate)
+- [x] GPT-5-mini val set: 40 games x 3 samples
 
-### Phase 2: Memory SFT (MeMo Supervised Training)
-- [ ] Convert GPT-5 transcripts to per-turn examples with memory documents (`prepare_textworld_sft.py`)
-- [ ] Embed memory docs with Qwen3-Embedding-4B
-- [ ] Train Memory module with MeMo `train.py` (LLM frozen, cross-entropy loss)
-- [ ] Evaluate: does memory improve over no-memory baseline on val/test?
+### Phase 2: Memory SFT (MeMo Supervised Training) -- DONE
+- [x] Convert GPT-5 transcripts to per-turn examples with memory documents
+- [x] Embed memory docs with Qwen3-Embedding-4B
+- [x] Train Memory module with MeMo trainer (3 checkpoints: w3, w5, w10)
+- [x] Evaluate: **memory shows +3% on train set but hurts on val/test** (see eval results above)
 
-### Phase 3: RL Fine-tuning (Optional)
-- [ ] Load Memory SFT checkpoint into SkyRL
-- [ ] Run RL with GRPO w3 or REINFORCE++ w10 on top of trained memory
-- [ ] Compare: SFT-only vs SFT+RL
+### Phase 3: RL Fine-tuning -- IN PROGRESS (Feb 10)
+- [x] Load Memory SFT checkpoints into SkyRL (fixed env, deps, dtype issues)
+- [x] Fix eval script to use proper SentenceTransformer encoding + EmbedsPrompt injection
+- [ ] 6 RL runs with constant LR: GRPO/R++ x w3/w5/w10 (running ~2h)
+- [ ] 6 RL runs with cosine scheduler: GRPO/R++ x w3/w5/w10 (running ~45min)
+- [ ] Compare: SFT-only vs SFT+RL vs baseline
 
 ### Other TODO
 - [ ] Fix standalone eval script to properly inject memory embeddings (not just placeholder text)
