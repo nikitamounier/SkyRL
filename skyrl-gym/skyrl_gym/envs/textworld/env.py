@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import lru_cache
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -100,28 +99,28 @@ class TextWorldEnv(BaseTextEnv):
     memory documents to a memory encoder modality.
     """
 
-    def __init__(self, env_config: DictConfig, extras: Dict[str, Any] = {}):
+    def __init__(self, env_config: DictConfig, extras: Optional[Dict[str, Any]] = None):
         super().__init__()
 
         self.env_config = env_config
-        self.extras = extras
+        self.extras = extras or {}
 
-        game_file = extras.get("game_file") or extras.get("extra_info", {}).get("game_file")
+        game_file = self.extras.get("game_file") or self.extras.get("extra_info", {}).get("game_file")
         if not game_file:
             raise ValueError("TextWorldEnv requires `game_file` in extras.")
         self.game_file = str(game_file)
 
-        self.max_turns = int(extras.get("max_turns") or env_config.get("max_turns", 50))
-        self.memory_window = int(extras.get("memory_window") or env_config.get("memory_window", 5))
-        self.max_memory_docs = int(extras.get("max_memory_docs") or env_config.get("max_memory_docs", 4))
-        self.max_doc_tokens = int(extras.get("max_doc_tokens") or env_config.get("max_doc_tokens", 256))
-        self.tokenizer_path = str(extras.get("tokenizer_path") or env_config.get("tokenizer_path", ""))
-        self.step_penalty = float(extras.get("step_penalty") or env_config.get("step_penalty", 0.0))
-        self.efficiency_bonus = float(extras.get("efficiency_bonus") or env_config.get("efficiency_bonus", 0.0))
+        self.max_turns = int(self.extras.get("max_turns") or env_config.get("max_turns", 50))
+        self.memory_window = int(self.extras.get("memory_window") or env_config.get("memory_window", 5))
+        self.max_memory_docs = int(self.extras.get("max_memory_docs") or env_config.get("max_memory_docs", 4))
+        self.step_penalty = float(self.extras.get("step_penalty") or env_config.get("step_penalty", 0.0))
+        self.efficiency_bonus = float(self.extras.get("efficiency_bonus") or env_config.get("efficiency_bonus", 0.0))
 
-        self.modality_id = str(extras.get("memory_modality_id") or env_config.get("memory_modality_id", "memo_memory"))
-        self.placeholder_token = str(extras.get("placeholder_token") or env_config.get("placeholder_token", "<|image_pad|>"))
-        self.max_placeholder_tokens = int(extras.get("max_placeholder_tokens") or env_config.get("max_placeholder_tokens", 8))
+        self.modality_id = str(self.extras.get("memory_modality_id") or env_config.get("memory_modality_id", "memo_memory"))
+        self.placeholder_token = str(self.extras.get("placeholder_token") or env_config.get("placeholder_token", "<|image_pad|>"))
+        self.max_placeholder_tokens = int(
+            self.extras.get("max_placeholder_tokens") or env_config.get("max_placeholder_tokens", 8)
+        )
 
         self._env = None
         self._game_state = None
@@ -257,18 +256,6 @@ class TextWorldEnv(BaseTextEnv):
             modalities_entry.payloads.pop(self.modality_id, None)
             modalities_entry.plans.pop(self.modality_id, None)
 
-    def _encode_document(self, text: str) -> List[int]:
-        if not text:
-            return []
-        tokenizer = _get_tokenizer(self.tokenizer_path)
-        encoded = tokenizer.encode(
-            text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_doc_tokens,
-        )
-        return list(encoded)
-
     def step(self, action: str) -> BaseTextEnvStepOutput:
         self.turns += 1
         parsed_action = self._parse_action(action) or "look"
@@ -360,12 +347,3 @@ class TextWorldEnv(BaseTextEnv):
             "won": bool(getattr(self._game_state, "won", False)) if self._game_state is not None else False,
             "score": score,
         }
-
-
-@lru_cache(maxsize=4)
-def _get_tokenizer(model_path: str):
-    if not model_path:
-        raise ValueError("TextWorldEnv requires `tokenizer_path` to encode memory documents.")
-    from transformers import AutoTokenizer  # local import to avoid hard dependency
-
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
