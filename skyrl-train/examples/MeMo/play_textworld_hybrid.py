@@ -410,7 +410,6 @@ def main():
                     "score": score,
                 })
 
-                g.pending_oracle = False
                 if len(g.current_segment) >= g.memory_window:
                     doc = create_memory_document(g.current_segment)
                     if doc:
@@ -418,10 +417,11 @@ def main():
                         if len(g.memory_documents) > g.max_memory_docs:
                             g.memory_documents = g.memory_documents[-g.max_memory_docs:]
                     g.current_segment = []
-                    # Mark for GPT oracle if game is still going
-                    if not g.done:
-                        g.pending_oracle = True
-                        g.pending_oracle_obs = obs.strip()
+
+                # Call GPT oracle on every turn that has memory documents
+                g.pending_oracle = bool(g.memory_documents and not g.done)
+                if g.pending_oracle:
+                    g.pending_oracle_obs = obs.strip()
 
                 # Finalize memory on game end
                 if g.done and g.current_segment:
