@@ -78,6 +78,21 @@ class ModalitiesManager:
                 self._placeholder_token_ids[modality_id] = tok_id
                 logger.info(f"Resolved placeholder for '{modality_id}': '{spec.placeholder_token}' -> {tok_id}")
 
+    @staticmethod
+    def _count_supported_occurrences(
+        available_placeholder_tokens: int,
+        reserved_tokens: Sequence[int],
+    ) -> int:
+        used = 0
+        supported = 0
+        for tokens_for_occurrence in reserved_tokens:
+            required = max(0, int(tokens_for_occurrence))
+            if used + required > available_placeholder_tokens:
+                break
+            used += required
+            supported += 1
+        return supported
+
     def ensure_embedding_spans(
         self,
         input_ids: torch.LongTensor,
@@ -90,7 +105,7 @@ class ModalitiesManager:
         """
         from skyrl_train.dataset.modalities import ModalityEmbeddingSpan, collect_embedding_spans
 
-        token_ids_map = getattr(self, '_placeholder_token_ids', {})
+        token_ids_map = getattr(self, "_placeholder_token_ids", {})
         if not token_ids_map:
             return
 
@@ -106,24 +121,25 @@ class ModalitiesManager:
                     continue
                 sample_ids = input_ids[sample_idx].tolist()
                 num_placeholder = sample_ids.count(tok_id)
-                tokens_per_occ = plan.reserved_tokens[0] if plan.reserved_tokens else 0
-                if tokens_per_occ <= 0:
+                if not plan.reserved_tokens:
                     continue
 
-                # How many occurrences can the actual input_ids support?
-                actual_occurrences = num_placeholder // tokens_per_occ
+                actual_occurrences = self._count_supported_occurrences(num_placeholder, plan.reserved_tokens)
                 if actual_occurrences <= 0:
-                    # No placeholder tokens at all - remove the plan
+                    # No placeholder tokens available for this plan; remove it.
                     del meta.plans[mod_id]
                     meta.payloads.pop(mod_id, None)
+                    meta.occurrence_payloads.pop(mod_id, None)
                     continue
 
                 if actual_occurrences < plan.occurrences:
-                    # Trim plan to match available tokens
+                    # Trim plan to match available placeholder tokens.
                     plan.occurrences = actual_occurrences
                     plan.reserved_tokens = plan.reserved_tokens[:actual_occurrences]
                     if isinstance(plan.payload, (list, tuple)):
                         plan.payload = plan.payload[:actual_occurrences]
+                    if mod_id in meta.occurrence_payloads:
+                        meta.occurrence_payloads[mod_id] = meta.occurrence_payloads[mod_id][:actual_occurrences]
 
                 try:
                     spans = collect_embedding_spans(sample_ids, tok_id, plan.reserved_tokens)
@@ -137,10 +153,11 @@ class ModalitiesManager:
                         for i, (start, length) in enumerate(spans)
                     ]
                 except ValueError as e:
-                    logger.debug(f"ensure_embedding_spans: sample {sample_idx}, {mod_id}: {e}")
-                    # Last resort: remove the plan entirely
+                    logger.debug("ensure_embedding_spans: sample {}, {}: {}", sample_idx, mod_id, e)
+                    # Last resort: remove the plan entirely.
                     del meta.plans[mod_id]
                     meta.payloads.pop(mod_id, None)
+                    meta.occurrence_payloads.pop(mod_id, None)
 
     def compute_embeddings(
         self,

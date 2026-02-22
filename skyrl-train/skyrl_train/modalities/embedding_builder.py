@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import glob
-import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
-from safetensors import safe_open
 from loguru import logger
+
+from skyrl_train.modalities.checkpoint_utils import load_embedding_weight
 
 EmbeddingSpan = Tuple[int, int]  # (start, length)
 
@@ -42,83 +41,44 @@ class PromptEmbeddingBuilder:
         if model_path is None:
             logger.warning("PromptEmbeddingBuilder did not receive a model checkpoint path; waiting for weight sync.")
             return
-        loaded = self._load_embedding_from_checkpoint(model_path)
-        if loaded is not None:
-            self._embedding_table = loaded.to(self.device, dtype=self.dtype)
-            logger.info(
-                "Loaded base embedding table from checkpoint `%s` with shape %s.",
-                model_path,
-                tuple(self._embedding_table.shape),
+
+        try:
+            loaded, name = load_embedding_weight(
+                model_path=model_path,
+                embedding_weight_names=self.embedding_weight_names,
+                modality_id="base_prompt",
             )
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("PromptEmbeddingBuilder failed to load embedding checkpoint from `{}`: {}", model_path, exc)
+            return
 
-    def _load_embedding_from_checkpoint(self, model_path: str) -> Optional[torch.Tensor]:
-        def _find_safetensors(search_dir: str) -> List[str]:
-            candidates: List[str] = []
-            primary = os.path.join(search_dir, "model.safetensors")
-            if os.path.isfile(primary):
-                candidates.append(primary)
-            else:
-                shard_pattern = os.path.join(search_dir, "model-*.safetensors")
-                candidates.extend(sorted(glob.glob(shard_pattern)))
-            return candidates
-
-        candidate_files: List[str] = []
-        if os.path.isdir(model_path):
-            candidate_files = _find_safetensors(model_path)
-
-        resolved_dir: Optional[str] = None
-        if not candidate_files:
-            try:
-                from huggingface_hub import snapshot_download
-
-                resolved_dir = snapshot_download(
-                    repo_id=model_path,
-                    allow_patterns=("*.safetensors",),
-                )
-                candidate_files = _find_safetensors(resolved_dir)
-            except Exception:
-                resolved_dir = None
-
-        if not candidate_files:
-            logger.warning(
-                "PromptEmbeddingBuilder could not find safetensors checkpoint under `%s`. "
-                "Expected `model.safetensors` or sharded files.",
-                resolved_dir or model_path,
+        # Prefer the discovered parameter name for future updates.
+        self.embedding_weight_names = [name] + [existing for existing in self.embedding_weight_names if existing != name]
+        if loaded.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"Loaded embedding dimension mismatch for `{model_path}`: "
+                f"expected {self.embedding_dim}, got {loaded.shape[1]}."
             )
-            return None
-
-        for file_path in candidate_files:
-            with safe_open(file_path, framework="pt", device="cpu") as handle:
-                for name in self.embedding_weight_names:
-                    if name in handle.keys():
-                        tensor = handle.get_tensor(name)
-                        if tensor.dim() != 2:
-                            logger.warning(
-                                "Embedding tensor `%s` from `%s` has unexpected shape %s.",
-                                name,
-                                file_path,
-                                tuple(tensor.shape),
-                            )
-                            continue
-                        # prefer the discovered parameter name for future updates
-                        self.embedding_weight_names = [name] + [
-                            existing for existing in self.embedding_weight_names if existing != name
-                        ]
-                        return tensor
-        logger.warning(
-            "PromptEmbeddingBuilder did not find any of %s in checkpoint directory `%s`.",
-            self.embedding_weight_names,
+        self._embedding_table = loaded.to(self.device, dtype=self.dtype)
+        logger.info(
+            "Loaded base embedding table from checkpoint `{}` with shape {}.",
             model_path,
+            tuple(self._embedding_table.shape),
         )
-        return None
 
     def update_from_named_weight(self, name: str, weight: torch.Tensor) -> None:
         if name not in self.embedding_weight_names:
             self.embedding_weight_names.append(name)
         self.set_base_embedding(weight)
-        logger.info("Updated base embedding table from weight sync `%s`.", name)
+        logger.info("Updated base embedding table from weight sync `{}`.", name)
 
     def set_base_embedding(self, weight: torch.Tensor) -> None:
+        if weight.dim() != 2:
+            raise ValueError(f"Base embedding weight must be 2D, got shape {tuple(weight.shape)}.")
+        if weight.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"Base embedding hidden size mismatch: expected {self.embedding_dim}, got {weight.shape[1]}."
+            )
         self._embedding_table = weight.detach().to(self.device, dtype=self.dtype)
 
     def gather_base_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -129,89 +89,104 @@ class PromptEmbeddingBuilder:
             )
         return torch.embedding(self._embedding_table, token_ids)
 
+    def _normalize_replacements(
+        self,
+        *,
+        sample_idx: int,
+        replacements: Sequence[Tuple[EmbeddingSpan, torch.Tensor]],
+        prompt_length: int,
+    ) -> List[Tuple[int, int, torch.Tensor]]:
+        normalized: List[Tuple[int, int, torch.Tensor]] = []
+        for (start, length), modality_tensor in replacements:
+            end = start + length
+            if start < 0 or length <= 0 or end > prompt_length:
+                raise ValueError(
+                    f"Replacement span ({start}, {length}) exceeds prompt length {prompt_length} "
+                    f"for sample {sample_idx}."
+                )
+            if modality_tensor.dim() != 2:
+                raise ValueError(
+                    f"Modality replacement tensor for sample {sample_idx} must be 2D; "
+                    f"got shape {tuple(modality_tensor.shape)}."
+                )
+            if modality_tensor.shape[0] != length:
+                raise ValueError(
+                    f"Replacement length mismatch for sample {sample_idx}: expected {length}, "
+                    f"got {modality_tensor.shape[0]}."
+                )
+            if modality_tensor.shape[1] != self.embedding_dim:
+                raise ValueError(
+                    f"Projection hidden size mismatch for sample {sample_idx}: expected {self.embedding_dim}, "
+                    f"got {modality_tensor.shape[1]}."
+                )
+            normalized.append(
+                (
+                    start,
+                    end,
+                    modality_tensor.to(device=self.device, dtype=self.dtype),
+                )
+            )
+
+        normalized.sort(key=lambda item: item[0])
+        prev_end = 0
+        for start, end, _ in normalized:
+            if start < prev_end:
+                raise ValueError(
+                    f"Overlapping modality replacement spans detected for sample {sample_idx}: "
+                    f"start={start} overlaps previous end={prev_end}."
+                )
+            prev_end = end
+        return normalized
+
+    def _apply_replacements(
+        self,
+        *,
+        embeds: torch.Tensor,
+        replacements: Sequence[Tuple[int, int, torch.Tensor]],
+    ) -> torch.Tensor:
+        if not replacements:
+            return embeds
+
+        parts: List[torch.Tensor] = []
+        cursor = 0
+        for start, end, modality_tensor in replacements:
+            if start > cursor:
+                parts.append(embeds[cursor:start])
+            parts.append(modality_tensor)
+            cursor = end
+
+        if cursor < embeds.shape[0]:
+            parts.append(embeds[cursor:])
+        return torch.cat(parts, dim=0)
+
     def build_prompt_embeddings_for_batch(
         self,
         prompt_token_ids: Sequence[Sequence[int]],
         modality_replacements: Dict[int, List[Tuple[EmbeddingSpan, torch.Tensor]]],
     ) -> List[torch.Tensor]:
-        # CRITICAL FIX: Wrap in torch.enable_grad() to ensure all embeddings get grad_fn
-        # Even if they're built from detached base embeddings
-        with torch.enable_grad():
-            from loguru import logger
-            outputs: List[torch.Tensor] = []
-            for sample_idx, token_ids in enumerate(prompt_token_ids):
-                token_tensor = torch.tensor(token_ids, device=self.device, dtype=torch.long)
-                # Mask out modality placeholder spans before embedding to avoid out-of-range ids
-                for (start, length), _ in modality_replacements.get(sample_idx, []):
-                    end = start + length
-                    if start < 0 or end > token_tensor.shape[0]:
-                        raise ValueError(
-                            f"Replacement span ({start}, {length}) exceeds prompt length {token_tensor.shape[0]}."
-                        )
+        outputs: List[torch.Tensor] = []
+        for sample_idx, token_ids in enumerate(prompt_token_ids):
+            token_tensor = torch.as_tensor(token_ids, device=self.device, dtype=torch.long)
+            normalized_replacements = self._normalize_replacements(
+                sample_idx=sample_idx,
+                replacements=modality_replacements.get(sample_idx, []),
+                prompt_length=token_tensor.shape[0],
+            )
+
+            # Mask placeholder spans to avoid invalid IDs before lookup.
+            if normalized_replacements:
+                token_tensor = token_tensor.clone()
+                for start, end, _ in normalized_replacements:
                     token_tensor[start:end] = 0
-                embeds = self.gather_base_embeddings(token_tensor)
 
-                # If there are modality replacements, build the tensor by concatenating slices
-                # to preserve gradient flow (in-place assignment breaks gradients)
-                replacements = modality_replacements.get(sample_idx, [])
-
-                logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: {len(replacements)} modality replacements")
-                logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'NONE'}")
-
-                if replacements:
-                    # Validate all replacements first
-                    for (start, length), modality_tensor in replacements:
-                        end = start + length
-                        if end > embeds.shape[0]:
-                            raise ValueError(
-                                f"Replacement span ({start}, {length}) exceeds prompt length {embeds.shape[0]}."
-                            )
-                        if modality_tensor.shape[1] != embeds.shape[1]:
-                            raise ValueError(
-                                "Projection hidden size mismatch. Expected %d, got %d."
-                                % (embeds.shape[1], modality_tensor.shape[1])
-                            )
-
-                    # Build the final tensor by concatenating base and modality embeddings
-                    # Sort replacements by start position to process them in order
-                    sorted_replacements = sorted(replacements, key=lambda x: x[0][0])
-                    parts = []
-                    last_end = 0
-
-                    for idx, ((start, length), modality_tensor) in enumerate(sorted_replacements):
-                        end = start + length
-                        # Add base embeddings before this modality span
-                        if start > last_end:
-                            parts.append(embeds[last_end:start])
-                        # Add modality embeddings
-                        parts.append(modality_tensor[:length])
-                        last_end = end
-
-                    # Add remaining base embeddings after the last modality span
-                    if last_end < embeds.shape[0]:
-                        parts.append(embeds[last_end:])
-
-                    embeds = torch.cat(parts, dim=0)
-                    logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: After concat, grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'NONE'}")
-                else:
-                    # CRITICAL FIX: If no modality embeddings, add dummy gradient
-                    # Base embeddings are detached, so multiply by trainable scalar to give grad_fn
-                    logger.warning(f"[EMBEDDING BUILDER] Sample {sample_idx}: NO modality replacements - adding dummy gradient")
-                    if embeds.grad_fn is None:
-                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds have NO grad_fn, multiplying by dummy_scale")
-                        dummy_scale = torch.ones(1, requires_grad=True, device=embeds.device, dtype=embeds.dtype)
-                        embeds = embeds * dummy_scale
-                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: After dummy_scale, grad_fn: {type(embeds.grad_fn).__name__ if embeds.grad_fn else 'STILL NONE!'}")
-                    else:
-                        logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: Base embeds already have grad_fn: {type(embeds.grad_fn).__name__}")
-
-                # Final check before appending
-                if embeds.grad_fn is None:
-                    logger.error(f"[EMBEDDING BUILDER] Sample {sample_idx}: FINAL embeds have NO grad_fn - backward will fail!")
-                else:
-                    logger.info(f"[EMBEDDING BUILDER] Sample {sample_idx}: FINAL embeds have grad_fn: {type(embeds.grad_fn).__name__}")
-
-                outputs.append(embeds)
+            embeds = self.gather_base_embeddings(token_tensor)
+            embeds = self._apply_replacements(embeds=embeds, replacements=normalized_replacements)
+            if embeds.shape[1] != self.embedding_dim:
+                raise ValueError(
+                    f"Embedding hidden size mismatch for sample {sample_idx}: expected {self.embedding_dim}, "
+                    f"got {embeds.shape[1]}."
+                )
+            outputs.append(embeds)
         return outputs
 
 

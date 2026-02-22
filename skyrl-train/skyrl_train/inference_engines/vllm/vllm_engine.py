@@ -474,9 +474,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             metadata_out: Optional[List[SampleModalityData]] = metadata_list
         else:
             prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
-            metadata_out = None if created_metadata else metadata_list if any(
-                md.plans or md.encoder_outputs or md.projected_embeddings for md in metadata_list
-            ) else None
+            metadata_out = None if created_metadata else metadata_list
         if metadata_out is not None:
             metadata_out = [meta.clone() for meta in metadata_out]
         return prompts, metadata_out

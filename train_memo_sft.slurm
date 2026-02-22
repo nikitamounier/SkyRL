@@ -40,7 +40,7 @@ echo "  Batch:  $BATCH_SIZE"
 echo "  LR:     $LR"
 echo "========================================="
 
-cd /home/parsaidp/MeMo
+cd /home/nikitamounier/MeMo
 
 python embed_and_train_textworld.py \
   --train_dir "$TRAIN_DIR" \

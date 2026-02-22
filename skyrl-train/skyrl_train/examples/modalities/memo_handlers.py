@@ -10,7 +10,6 @@ are then injected into the prompt via modality placeholders.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import glob
 import importlib.util
 import os
 import sys
@@ -21,10 +20,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger
-from safetensors import safe_open
 from torch.nn.utils.rnn import pad_sequence
-from huggingface_hub import snapshot_download
 
+from skyrl_train.modalities.checkpoint_utils import load_embedding_weight, load_module_checkpoint
 from skyrl_train.modalities.handlers import ModalityEncoderProtocol, ModalityProjectorProtocol
 from skyrl_train.utils.utils import str_to_torch_dtype
 
@@ -140,75 +138,31 @@ def _as_tensor(value: Any, *, dtype: Optional[torch.dtype] = None, device: Optio
     return tensor
 
 
-def _resolve_model_dir(model_path: str, modality_id: str) -> str:
-    if os.path.isdir(model_path):
-        return model_path
-    try:
-        local_dir = snapshot_download(
-            repo_id=model_path,
-            allow_patterns=("*.safetensors",),
-        )
-        logger.info(
-            "Resolved repo id `%s` to local snapshot `%s` for modality `%s`.",
-            model_path,
-            local_dir,
-            modality_id,
-        )
-        return local_dir
-    except Exception:
-        logger.exception(
-            "Failed to resolve repo id `%s`; falling back to raw path for modality `%s`.",
-            model_path,
-            modality_id,
-        )
-        return model_path
-
-
-def _load_embedding_weight(
-    model_path: str,
+def _load_memory_checkpoint(
+    memory_module: nn.Module,
+    *,
+    checkpoint_path: str,
+    prefix: str,
     modality_id: str,
-    embedding_weight_names: Sequence[str],
-) -> torch.Tensor:
-    model_dir = _resolve_model_dir(model_path, modality_id)
-
-    candidate_files: List[str] = []
-    primary = os.path.join(model_dir, "model.safetensors")
-    if os.path.isfile(primary):
-        candidate_files.append(primary)
-    else:
-        shard_pattern = os.path.join(model_dir, "model-*.safetensors")
-        candidate_files.extend(sorted(glob.glob(shard_pattern)))
-
-    if not candidate_files:
-        raise FileNotFoundError(
-            f"No safetensors checkpoint found under `{model_dir}` for modality `{modality_id}`."
-        )
-
-    for path in candidate_files:
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            for name in embedding_weight_names:
-                if name in handle.keys():
-                    tensor = handle.get_tensor(name)
-                    if tensor.dim() != 2:
-                        logger.warning(
-                            "Ignoring embedding `%s` in `%s` due to unexpected shape %s.",
-                            name,
-                            path,
-                            tuple(tensor.shape),
-                        )
-                        continue
-                    logger.info(
-                        "Loaded embedding weight `%s` for modality `%s` from `%s` (shape=%s).",
-                        name,
-                        modality_id,
-                        path,
-                        tuple(tensor.shape),
-                    )
-                    return tensor
-
-    raise RuntimeError(
-        f"Could not find embedding weights {embedding_weight_names} in `{model_dir}` for modality `{modality_id}`."
+) -> int:
+    missing, unexpected = load_module_checkpoint(
+        memory_module,
+        checkpoint_path=checkpoint_path,
+        prefix=prefix,
+        module_name=f"memory module `{modality_id}`",
     )
+    total_params = len(memory_module.state_dict())
+    loaded_params = total_params - len(missing)
+    logger.info(
+        "Checkpoint {} for modality `{}`: loaded {}/{} params (missing={}, unexpected={}).",
+        checkpoint_path,
+        modality_id,
+        loaded_params,
+        total_params,
+        len(missing),
+        len(unexpected),
+    )
+    return loaded_params
 
 
 @dataclass
@@ -349,7 +303,12 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             self.to(device=self._target_device, dtype=self._target_dtype)
 
         if checkpoint_path:
-            self._load_checkpoint(checkpoint_path, prefix=checkpoint_prefix)
+            _load_memory_checkpoint(
+                self.memory,
+                checkpoint_path=checkpoint_path,
+                prefix=checkpoint_prefix,
+                modality_id=self.modality_id,
+            )
 
         self.memory_bank = memory_bank
         if self.memory_bank is None and memory_embeddings_files:
@@ -370,25 +329,6 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
                 dtype=bank_dtype,
                 device=bank_device,
             )
-
-    def _load_checkpoint(self, checkpoint_path: str, *, prefix: str) -> None:
-        state = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = state.get("state_dict", state)
-        if not isinstance(state_dict, dict):
-            raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict.")
-        filtered = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
-        if not filtered:
-            logger.warning(
-                "No parameters matched prefix '%s' in checkpoint %s; loading full state_dict.",
-                prefix,
-                checkpoint_path,
-            )
-            filtered = state_dict
-        missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
-        if missing:
-            logger.warning("Missing keys when loading memory checkpoint: %s", missing)
-        if unexpected:
-            logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
 
     def _resolve_payload(self, payload: Any) -> MemoryPayload:
         if payload is None:
@@ -552,7 +492,11 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         self.output_dim = output_dim
 
         embedding_weight_names = list(embedding_weight_names or self.DEFAULT_EMBEDDING_NAMES)
-        embedding_weight = _load_embedding_weight(model_path, modality_id, embedding_weight_names)
+        embedding_weight, _ = load_embedding_weight(
+            model_path=model_path,
+            embedding_weight_names=embedding_weight_names,
+            modality_id=modality_id,
+        )
         if embedding_weight.shape[1] != embedding_dim:
             raise ValueError(
                 f"Embedding dim mismatch for `{modality_id}`: weight dim {embedding_weight.shape[1]} "
@@ -573,26 +517,12 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             self.to(device=self._target_device, dtype=self._target_dtype)
 
         if checkpoint_path:
-            self._load_checkpoint(checkpoint_path, prefix=checkpoint_prefix)
-
-    def _load_checkpoint(self, checkpoint_path: str, *, prefix: str) -> None:
-        state = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = state.get("state_dict", state)
-        if not isinstance(state_dict, dict):
-            raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict.")
-        filtered = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
-        if not filtered:
-            logger.warning(
-                "No parameters matched prefix '%s' in checkpoint %s; loading full state_dict.",
-                prefix,
-                checkpoint_path,
+            _load_memory_checkpoint(
+                self.memory,
+                checkpoint_path=checkpoint_path,
+                prefix=checkpoint_prefix,
+                modality_id=self.modality_id,
             )
-            filtered = state_dict
-        missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
-        if missing:
-            logger.warning("Missing keys when loading memory checkpoint: %s", missing)
-        if unexpected:
-            logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
 
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         outputs: List[torch.Tensor] = []
@@ -732,7 +662,20 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
         self._embedding_model = None  # Lazy-load on first use
 
         if checkpoint_path:
-            self._load_checkpoint(checkpoint_path, prefix=checkpoint_prefix)
+            loaded_params = _load_memory_checkpoint(
+                self.memory,
+                checkpoint_path=checkpoint_path,
+                prefix=checkpoint_prefix,
+                modality_id=self.modality_id,
+            )
+            if loaded_params == 0:
+                logger.error(
+                    "No parameters loaded from checkpoint `{}` for modality `{}`. "
+                    "Check checkpoint_prefix (`{}`) and checkpoint key format.",
+                    checkpoint_path,
+                    self.modality_id,
+                    checkpoint_prefix,
+                )
 
     def _get_embedding_model(self):
         """Lazy-load the SentenceTransformer model on first use."""
@@ -752,36 +695,6 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
                 tokenizer_kwargs={"padding_side": "left"},
             )
         return self._embedding_model
-
-    def _load_checkpoint(self, checkpoint_path: str, *, prefix: str) -> None:
-        state = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = state.get("state_dict", state)
-        if not isinstance(state_dict, dict):
-            raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a state_dict.")
-        filtered = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-        if not filtered:
-            logger.warning(
-                "No parameters matched prefix '%s' in checkpoint %s; loading full state_dict.",
-                prefix,
-                checkpoint_path,
-            )
-            filtered = state_dict
-        missing, unexpected = self.memory.load_state_dict(filtered, strict=False)
-        total_params = len(list(self.memory.state_dict().keys()))
-        loaded_params = total_params - len(missing)
-        logger.info(
-            "Checkpoint %s: loaded %d/%d params (missing=%d, unexpected=%d)",
-            checkpoint_path, loaded_params, total_params, len(missing), len(unexpected),
-        )
-        if missing:
-            logger.warning("Missing keys when loading memory checkpoint: %s", missing)
-        if unexpected:
-            logger.warning("Unexpected keys when loading memory checkpoint: %s", unexpected)
-        if loaded_params == 0:
-            logger.error(
-                "NO parameters loaded from checkpoint! Check checkpoint_prefix (got '%s') "
-                "and checkpoint key format.", prefix,
-            )
 
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         """Encode payloads into memory tokens (batched).
@@ -922,6 +835,7 @@ __all__ = [
     "MemoryEmbeddingsBank",
     "MemoMemoryEncoder",
     "MemoTokenMemoryEncoder",
+    "MemoSentenceEmbeddingEncoder",
     "IdentityProjection",
     "LinearProjection",
 ]

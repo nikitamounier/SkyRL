@@ -3,7 +3,7 @@
 #SBATCH --output=train_textworld_memo_%j.out
 #SBATCH --error=train_textworld_memo_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=preemptible
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -11,8 +11,8 @@
 #SBATCH --mem=96G
 #
 # Usage:
-#   sbatch train_textworld_memo.slurm                                  # gpu, 24h, 50 epochs
-#   sbatch -p preemptible train_textworld_memo.slurm                   # preemptible partition
+#   sbatch train_textworld_memo.slurm                                  # preemptible, 24h, 50 epochs
+#   sbatch -p gpu train_textworld_memo.slurm                           # non-preemptible gpu partition
 #   sbatch -p preemptible -t 02:00:00 train_textworld_memo.slurm      # short test run
 #   EPOCHS=2 sbatch train_textworld_memo.slurm                        # quick 2-epoch test
 #   RESUME_MODE=auto sbatch train_textworld_memo.slurm                # resume from checkpoint
