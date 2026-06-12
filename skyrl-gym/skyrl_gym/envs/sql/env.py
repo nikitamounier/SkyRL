@@ -4,8 +4,14 @@ from skyrl_gym.tools import SQLCodeExecutorToolGroup
 import re
 from skyrl_gym.envs.sql.utils import compute_score_single
 import os
-from typing import Dict
+from typing import Dict, Union
 from omegaconf import DictConfig
+from dataclasses import dataclass
+
+
+@dataclass
+class Text2SQLEnvConfig:
+    db_path: str = "/home/ray/default/sql_data"
 
 
 class SQLEnv(BaseTextEnv):
@@ -13,7 +19,7 @@ class SQLEnv(BaseTextEnv):
     Environment for one SQL execution task.
     """
 
-    def __init__(self, env_config: DictConfig, extras: Dict[str, Any] = {}):
+    def __init__(self, env_config: Union[Text2SQLEnvConfig, DictConfig], extras: Dict[str, Any] = {}):
         super().__init__()
 
         # Initialize the environment
@@ -89,18 +95,8 @@ class SQLEnv(BaseTextEnv):
             return True
         return "<solution>" in action and "</solution>" in action
 
-    def _validate_action(self, action: str):
-        stop_tags = ["</sql>", "</solution>"]
-        for tag in stop_tags:
-            if tag in action:
-                assert action.split(tag, 1)[1] == "", (
-                    f"{tag} detected in the response but it is not the last string generated. "
-                    f"Use {stop_tags} as stop strings in the configuration."
-                )
-
     def step(self, action: str) -> BaseTextEnvStepOutput:
         self.turns += 1
-        self._validate_action(action)
         self.chat_history.append({"role": "assistant", "content": action})
 
         error = None
