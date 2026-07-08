@@ -88,6 +88,10 @@ class FSDPWeightExtractor(WeightExtractor):
         # FSDP2 state_dict returns DTensors directly; no state_dict_type configuration needed.
         params = self.model.state_dict()
 
+        # Modality handler params (e.g. the RNA projection) are trained on the policy but are
+        # not vLLM model params, so they must not be pushed to the inference engine.
+        params = {k: v for k, v in params.items() if "_skyrl_modality_modules" not in k}
+
         if self.weight_prefix:
             params = {f"{self.weight_prefix}{k}": v for k, v in params.items()}
 
@@ -121,6 +125,8 @@ class FSDPWeightExtractor(WeightExtractor):
         shapes = []
         dtype_name = str(dtype).split(".")[-1]
         for name, param in self.model.state_dict().items():
+            if "_skyrl_modality_modules" in name:  # trained on policy, not a vLLM param
+                continue
             names.append(f"{self.weight_prefix}{name}" if self.weight_prefix else name)
             dtype_names.append(dtype_name)
             shapes.append(list(param.shape))
@@ -178,6 +184,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            modalities_config=self.cfg.policy.model.modalities_config,
+            modality_pad_token_ids=self.cfg.policy.model.modality_pad_token_ids,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

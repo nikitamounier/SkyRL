@@ -8,7 +8,9 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
+from torch.distributed.tensor import DTensor
 from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
 from packaging.version import Version
@@ -31,6 +33,8 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+from skyrl.train.dataset.modalities import normalize_modalities_config
+from skyrl.train.modalities.runtime import ModalitiesManager
 
 
 class HFModelWrapper(nn.Module):
@@ -81,6 +85,8 @@ class HFModelWrapper(nn.Module):
         meta_init: bool = False,
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
+        modalities_config: Optional[dict] = None,
+        modality_pad_token_ids: Optional[dict] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -236,6 +242,23 @@ class HFModelWrapper(nn.Module):
 
         self.logprobs_chunk_size = logprobs_chunk_size
 
+        # Modalities: inject arbitrary precomputed embeddings (e.g. RNA evo2 features) at
+        # placeholder-token spans. Handler modules (e.g. the trainable projection) are
+        # registered under `self.model` so the optimizer, FSDP wrapping, and weight sync
+        # all capture them alongside the base/LoRA params.
+        self.modality_specs = normalize_modalities_config(modalities_config)
+        self.modalities_manager: Optional[ModalitiesManager] = (
+            ModalitiesManager(self.modality_specs) if self.modality_specs else None
+        )
+        if self.modalities_manager is not None:
+            modality_modules = nn.ModuleDict()
+            for modality_id, role, module in self.modalities_manager.iter_handler_modules():
+                if isinstance(module, nn.Module):
+                    modality_modules[f"{modality_id}__{role}"] = module
+            self.model.add_module("_skyrl_modality_modules", modality_modules)
+        # modality_id -> placeholder token id (resolved against the tokenizer at the entrypoint).
+        self.modality_pad_token_ids = modality_pad_token_ids or {}
+
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
         self.chunked_entropy_from_logits_fn = (
@@ -243,6 +266,47 @@ class HFModelWrapper(nn.Module):
             if use_torch_compile
             else chunked_entropy_from_logits
         )
+
+    def prepare_inputs_embeds(
+        self,
+        input_ids: torch.LongTensor,
+        rna_embeds: Optional[TensorList] = None,
+    ) -> Optional[torch.Tensor]:
+        """Build input embeddings with modality projections spliced in at placeholder tokens.
+
+        `rna_embeds` carries one precomputed embedding tensor per sample (shape
+        ``[n_res_i, embedding_dim]``) on the same per-sample `TensorList` channel used by
+        `pixel_values`. Each is projected by the (trainable) modality projection and written
+        into the rows where `input_ids == placeholder_token_id`. Returns None when there is
+        nothing to inject (caller then forwards token ids as usual).
+        """
+        if self.modalities_manager is None or rna_embeds is None or not self.modality_pad_token_ids:
+            return None
+
+        embs = rna_embeds.tensors if isinstance(rna_embeds, TensorList) else list(rna_embeds)
+        if not any(e is not None for e in embs):
+            return None
+        if len(embs) != input_ids.size(0):
+            raise ValueError(f"Expected {input_ids.size(0)} rna_embeds, got {len(embs)}.")
+
+        # Compute base embeddings DTensor-safely: under FSDP2 the embedding weight is a
+        # sharded DTensor, so gather it to a full tensor and embed manually (the model itself
+        # then skips its embedding layer since we pass inputs_embeds).
+        emb_weight = self.model.get_input_embeddings().weight
+        if isinstance(emb_weight, DTensor):
+            emb_weight = emb_weight.full_tensor()
+        inputs_embeds = F.embedding(input_ids, emb_weight)
+
+        # Delegate the actual splice to the modality handler's `inject`, which reproduces
+        # BioReasonRNA.inject_rna_embeddings exactly (markers + projected pads) so the SkyRL
+        # forward is byte-identical to the SFT/eval injection.
+        for modality_id in self.modality_pad_token_ids:
+            projector = self.modalities_manager.get_module_by_name(f"{modality_id}.projection")
+            if projector is None or not hasattr(projector, "inject"):
+                continue
+            raw = [e.to(device=inputs_embeds.device) for e in embs]
+            inputs_embeds = projector.inject(input_ids, inputs_embeds, raw)
+        return inputs_embeds
 
     def forward(
         self,
@@ -256,9 +320,17 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        rna_embeds: Optional[TensorList] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
+
+        # Modality embedding injection (e.g. RNA evo2 features at <|rna_pad|> positions).
+        inputs_embeds = self.prepare_inputs_embeds(sequences, rna_embeds)
+        if inputs_embeds is not None:
+            assert not self.remove_microbatch_padding, "modality injection unsupported with remove_microbatch_padding"
+            assert self.sequence_parallel_size == 1, "modality injection unsupported with sequence parallelism"
+            assert not self.is_vlm, "modality injection and image-VLM path are mutually exclusive"
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
             # Sequence packing requires computing position IDs, but position IDs for VLMs are 3D and require
@@ -333,6 +405,10 @@ class HFModelWrapper(nn.Module):
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
             output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
+        elif inputs_embeds is not None:
+            output = self.model(
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
+            )
         else:
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
 

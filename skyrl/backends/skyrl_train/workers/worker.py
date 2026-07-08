@@ -813,6 +813,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                rna_embeds=experience.rna_embeds,
             )
             # loss function
             # TODO: recompute advantages
@@ -1056,6 +1057,7 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=False,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
+                rna_embeds=experience.rna_embeds,
             )
             policy_loss, _ = current_loss_fn(
                 action_log_probs,
@@ -1112,6 +1114,7 @@ class PolicyWorkerBase(Worker):
         attention_mask = micro_batch["attention_mask"]
         pixel_values = micro_batch.get("pixel_values", None)
         image_grid_thw = micro_batch.get("image_grid_thw", None)
+        rna_embeds = micro_batch.get("rna_embeds", None)
 
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             policy_logprob = self.model(
@@ -1122,6 +1125,7 @@ class PolicyWorkerBase(Worker):
                 temperature=self.cfg.algorithm.temperature,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                rna_embeds=rna_embeds,
             )
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(
@@ -1383,6 +1387,7 @@ class RefWorkerBase(Worker):
         attention_mask = micro_batch["attention_mask"]
         pixel_values = micro_batch.get("pixel_values", None)
         image_grid_thw = micro_batch.get("image_grid_thw", None)
+        rna_embeds = micro_batch.get("rna_embeds", None)
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             log_probs = self.model(
                 sequences,
@@ -1391,6 +1396,7 @@ class RefWorkerBase(Worker):
                 return_output=False,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                rna_embeds=rna_embeds,
             )
         log_probs = log_probs.to("cpu")
         output = TrainingOutputBatch(

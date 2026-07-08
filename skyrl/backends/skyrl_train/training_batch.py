@@ -472,6 +472,7 @@ class TrainingInput(TypedDict, total=False):
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
+    rna_embeds: Optional[TensorList]  # list of `batch_size` [n_res_i, embedding_dim] RNA embeddings
 
 
 class TrainingInputBatch(TensorBatch[TrainingInput]):

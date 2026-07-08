@@ -74,6 +74,7 @@ class Experience:
     metadata: Optional[Dict[str, Any]] = None
     pixel_values: Optional[TensorList] = None
     image_grid_thw: Optional[TensorList] = None
+    rna_embeds: Optional[TensorList] = None
     # Per-row sub-sequence lengths for sequence packing (one 1-D int tensor per
     # packed row); ``None`` when packing is off.
     sub_seq_lengths: Optional[TensorList] = None
@@ -105,6 +106,8 @@ class Experience:
             self.pixel_values = self.pixel_values.to(device)
         if self.image_grid_thw is not None:
             self.image_grid_thw = self.image_grid_thw.to(device)
+        if self.rna_embeds is not None:
+            self.rna_embeds = self.rna_embeds.to(device)
         if self.sub_seq_lengths is not None:
             self.sub_seq_lengths = self.sub_seq_lengths.to(device)
 

@@ -105,6 +105,11 @@ class SkyRLLoraConfig(BaseConfig):
 class ModelConfig(BaseConfig):
     path: Optional[str] = None
     lora: SkyRLLoraConfig = field(default_factory=SkyRLLoraConfig)
+    # Arbitrary precomputed-embedding modalities (e.g. RNA evo2 features). Maps
+    # modality_id -> {placeholder_token, encoder{target,kwargs}, projection{target,kwargs}, trainable}.
+    modalities_config: Optional[dict] = None
+    # modality_id -> placeholder token id, resolved against the tokenizer at the entrypoint.
+    modality_pad_token_ids: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

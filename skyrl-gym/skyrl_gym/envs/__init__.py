@@ -37,6 +37,16 @@ register(
     entry_point="skyrl_gym.envs.searchcode.env:SearchCodeEnv",
 )
 
+register(
+    id="random_reward",
+    entry_point="skyrl_gym.envs.random_reward.env:RandomRewardEnv",
+)
+
+register(
+    id="rna_expression",
+    entry_point="skyrl_gym.envs.rna_expression.env:RNAExpressionEnv",
+)
+
 __all__ = [
     "deregister",
     "register",

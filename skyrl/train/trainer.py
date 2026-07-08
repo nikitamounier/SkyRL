@@ -756,6 +756,10 @@ class RayPPOTrainer:
             pixel_values = TensorList(pixel_values)
             image_grid_thw = TensorList(image_grid_thw)
 
+        rna_embeds = generator_output.get("rna_embeds", None)
+        if rna_embeds is not None:
+            rna_embeds = TensorList(rna_embeds)
+
         # 2. Convert to tensors.
         (
             sequences_tensor,
@@ -798,6 +802,7 @@ class RayPPOTrainer:
                 "rollout_expert_indices": rollout_expert_indices_tensor,
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
+                "rna_embeds": rna_embeds,
             },
         )
         training_input.metadata = {"uids": uids}

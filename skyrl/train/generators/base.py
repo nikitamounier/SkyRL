@@ -52,6 +52,9 @@ class GeneratorOutput(TypedDict):
     # Applicable only for vision-language models
     pixel_values: Optional[List[torch.Tensor]]
     image_grid_thw: Optional[List[torch.Tensor]]
+    # Per-sample precomputed RNA embeddings ([n_res_i, embedding_dim]); injected at
+    # <|rna_pad|> positions. Rides the same per-sample channel as pixel_values.
+    rna_embeds: Optional[List[torch.Tensor]]
 
 
 class MetricsOutput(TypedDict):
