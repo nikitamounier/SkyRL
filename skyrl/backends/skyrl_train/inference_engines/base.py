@@ -29,6 +29,9 @@ class InferenceEngineInput(TypedDict):
     sampling_params: Optional[Dict[str, Any]]
     session_ids: Optional[List[Hashable]]
     mm_features: Optional[List[MultiModalFeatures]]
+    # Per-sample precomputed prompt embeddings ([seq_len_i, hidden]); when present the engine
+    # generates from EmbedsPrompt instead of token ids (RNA-conditioned on-policy rollout).
+    prompt_embeds: Optional[List[Any]]
 
 
 class InferenceEngineOutput(TypedDict):

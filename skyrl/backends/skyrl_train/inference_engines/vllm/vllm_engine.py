@@ -276,6 +276,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        prompt_embeds = input_batch.get("prompt_embeds")
 
         # Check if LoRA is enabled and create LoRA requests
         lora_requests = None
@@ -289,9 +290,18 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/dummy_lora_path")
                 ] * batch_size
 
+        if prompt_embeds is not None:
+            # RNA-conditioned rollout: generate from precomputed prompt embeddings so the model
+            # sees the exact same injected inputs_embeds as the training forward.
+            from vllm.inputs import EmbedsPrompt
+
+            vllm_prompts = [EmbedsPrompt(prompt_embeds=pe) for pe in prompt_embeds]
+        else:
+            vllm_prompts = [TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids]
+
         outputs = await asyncio.to_thread(
             self.llm.generate,
-            prompts=[TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids],
+            prompts=vllm_prompts,
             sampling_params=sampling_params,
             lora_request=lora_requests,
         )
