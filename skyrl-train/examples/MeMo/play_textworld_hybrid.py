@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Hybrid data generation: Qwen3 plays TextWorld games (vLLM), GPT predicts
-best actions at memory steps (when memory documents accumulate).
+Hybrid data generation — two stages:
 
-Qwen3's actions drive the game. GPT's predictions are saved as SFT labels
-on Qwen3's actual state distribution.
+  Stage 1 (GPU, no internet): Qwen3 plays TextWorld games via vLLM.
+    Saves full transcripts with memory document snapshots at every turn.
+
+  Stage 2 (CPU/login, internet): GPT oracle annotates transcripts.
+    For every turn that has memory documents, GPT predicts the best action.
+    Saves oracle samples as SFT training labels.
 
 Usage:
-    # Full run
-    python play_textworld_hybrid.py \
+    # Stage 1: Qwen3 plays on GPU node
+    python play_textworld_hybrid.py stage1 \
         --data_file ~/data/textworld_memo/train.parquet \
-        --model_path Qwen/Qwen3-4B-Instruct-2507 \
-        --gpt_model gpt-5-mini \
-        --memory_window 5 --batch_size 20 --gpt_workers 8 \
+        --memory_window 5 --batch_size 20 \
         --output_dir /path/to/output
 
-    # Quick test (no GPU needed — uses fast sim only with GPT oracle)
-    python play_textworld_hybrid.py \
-        --data_file ~/data/textworld_memo/test.parquet \
-        --max_games 3 --memory_window 5 \
-        --output_dir /tmp/hybrid_test
+    # Stage 2: GPT oracle on login node (has internet)
+    OPENAI_API_KEY=sk-... python play_textworld_hybrid.py stage2 \
+        --transcript_dir /path/to/output \
+        --gpt_model gpt-5-mini --gpt_workers 8
 """
 from __future__ import annotations
 
@@ -40,8 +40,6 @@ import pandas as pd
 # Add skyrl-gym to path for FastTextWorldSimulator
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "skyrl-gym"))
 from skyrl_gym.envs.textworld.fast_sim import FastTextWorldSimulator
-
-from openai import OpenAI
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +127,6 @@ def create_memory_document(segment: List[Dict]) -> str:
 
 
 def resolve_game_json(game_file: str) -> str:
-    """Resolve .z8 path to .json for FastTextWorldSimulator."""
     if game_file.endswith(".z8"):
         return game_file[:-3] + ".json"
     if game_file.endswith(".json"):
@@ -137,9 +134,9 @@ def resolve_game_json(game_file: str) -> str:
     return game_file + ".json"
 
 
-# ---------------------------------------------------------------------------
-# Game state
-# ---------------------------------------------------------------------------
+# ===================================================================
+# STAGE 1: Qwen3 plays games on GPU (no internet needed)
+# ===================================================================
 
 @dataclass
 class GameState:
@@ -155,111 +152,14 @@ class GameState:
     final_score: int = 0
     num_turns: int = 0
     total_reward: float = 0.0
-    # Memory tracking
     memory_window: int = 5
     max_memory_docs: int = 20
     current_segment: List[Dict] = field(default_factory=list)
     memory_documents: List[str] = field(default_factory=list)
-    # Oracle data — collected at memory steps
-    oracle_samples: List[Dict[str, Any]] = field(default_factory=list)
-    # Flag: this game needs GPT oracle call this turn
-    pending_oracle: bool = False
-    pending_oracle_obs: str = ""
 
 
-# ---------------------------------------------------------------------------
-# GPT oracle call
-# ---------------------------------------------------------------------------
-
-def call_gpt_oracle(
-    client: OpenAI,
-    model: str,
-    game: GameState,
-    observation: str,
-) -> Dict[str, Any]:
-    """Call GPT API with game history + memory to predict best action."""
-    # Build GPT messages: oracle system prompt + memory + conversation history
-    memory_text = ""
-    if game.memory_documents:
-        memory_text = "\n\nMemory from previous turns:\n" + "\n\n---\n".join(game.memory_documents)
-
-    gpt_messages = [
-        {"role": "system", "content": GPT_ORACLE_SYSTEM_PROMPT + memory_text}
-    ]
-
-    # Add conversation history (user observations + assistant actions)
-    for turn_data in game.turns:
-        gpt_messages.append({"role": "user", "content": turn_data["observation"]})
-        gpt_messages.append({"role": "assistant", "content": f"[ACTION: {turn_data['action']}]"})
-
-    # Add current observation
-    gpt_messages.append({"role": "user", "content": observation})
-
-    gpt_response = ""
-    # Retry up to 3 times — GPT-5-mini intermittently returns empty content
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=gpt_messages,
-                temperature=1.0,
-                max_completion_tokens=512,
-            )
-            gpt_response = response.choices[0].message.content or ""
-            if gpt_response:
-                break
-        except Exception as e:
-            gpt_response = f"[ERROR: {e}]\n[ACTION: look]"
-            break
-
-    gpt_action = parse_action(gpt_response)
-
-    return {
-        "game_id": game.game_id,
-        "turn": game.num_turns,
-        "memory_documents": list(game.memory_documents),
-        "num_memory_docs": len(game.memory_documents),
-        "prompt": gpt_messages,
-        "gpt_response": gpt_response,
-        "gpt_action": gpt_action,
-        "qwen3_action": game.turns[-1]["action"] if game.turns else "",
-        "qwen3_response": game.turns[-1].get("model_response", "") if game.turns else "",
-        "score": game.final_score,
-        "reward": game.turns[-1]["reward"] if game.turns else 0.0,
-        "game_won": game.won,
-        "game_done": game.done,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(description="Hybrid Qwen3 + GPT oracle data generation")
-    # Data
-    parser.add_argument("--data_file", type=str, required=True)
-    parser.add_argument("--max_games", type=int, default=None)
-    parser.add_argument("--output_dir", type=str, required=True)
-    # Qwen3 (vLLM)
-    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--max_turns", type=int, default=50)
-    parser.add_argument("--max_generate_length", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--gpu_memory", type=float, default=0.95)
-    parser.add_argument("--batch_size", type=int, default=20)
-    # GPT oracle
-    parser.add_argument("--gpt_model", type=str, default="gpt-5-mini")
-    parser.add_argument("--gpt_workers", type=int, default=8)
-    # Memory
-    parser.add_argument("--memory_window", type=int, default=5)
-    parser.add_argument("--max_memory_docs", type=int, default=20)
-    # Misc
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--skip_existing", action="store_true")
-    args = parser.parse_args()
-
+def run_stage1(args):
+    """Qwen3 plays games via vLLM. Saves transcripts with memory snapshots."""
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load dataset
@@ -286,7 +186,6 @@ def main():
                 model_path = str(snapshots[0])
                 print(f"Using local snapshot: {model_path}")
 
-    # Load vLLM
     from vllm import LLM, SamplingParams
 
     print(f"\nLoading Qwen3: {model_path}")
@@ -306,29 +205,21 @@ def main():
         seed=args.seed,
     )
 
-    # OpenAI client for GPT oracle
-    gpt_client = OpenAI()
-
     total_games = len(game_files)
     print(f"\nGames: {total_games}")
-    print(f"Qwen3: {model_path} (batch={args.batch_size})")
-    print(f"GPT oracle: {args.gpt_model} (workers={args.gpt_workers})")
     print(f"Memory window: {args.memory_window}")
     print(f"Output: {args.output_dir}")
     print("=" * 70)
 
-    all_oracle_samples = []
-    total_oracle_calls = 0
     total_wins = 0
-    t_start = time.time()
     games_done = 0
+    t_start = time.time()
 
     for batch_start in range(0, total_games, args.batch_size):
         batch_files = game_files[batch_start:batch_start + args.batch_size]
         print(f"\nBatch {batch_start // args.batch_size + 1}/{(total_games + args.batch_size - 1) // args.batch_size}: "
               f"games {batch_start+1}-{batch_start+len(batch_files)}")
 
-        # Initialize games
         games: List[GameState] = []
         for i, gf in enumerate(batch_files):
             game_json = resolve_game_json(gf)
@@ -346,16 +237,14 @@ def main():
             gs.messages.append({"role": "user", "content": obs.strip()})
             games.append(gs)
 
-        # Turn loop
         for turn in range(1, args.max_turns + 1):
             active = [g for g in games if not g.done]
             if not active:
                 break
 
-            # --- Qwen3 batch inference ---
+            # Qwen3 batch inference
             prompts = []
             for g in active:
-                # Inject memory into system message if available
                 if g.memory_documents:
                     memory_text = "\n\nMemory from previous turns:\n" + "\n\n---\n".join(g.memory_documents)
                     g.messages[0]["content"] = QWEN_SYSTEM_PROMPT + memory_text
@@ -369,18 +258,17 @@ def main():
 
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
 
-            # --- Process Qwen3 responses + step games ---
             for g, output in zip(active, outputs):
                 raw_response = output.outputs[0].text
                 action = parse_action(raw_response)
-
-                # Current observation (the last user message)
                 current_obs = g.messages[-1]["content"]
 
-                # Step the game with Qwen3's action
                 obs, reward, done, info = g.sim.step(action)
                 score = info.get("score", 0)
                 won = info.get("won", False)
+
+                # Snapshot memory docs at this turn BEFORE updating them
+                memory_snapshot = list(g.memory_documents)
 
                 g.turns.append({
                     "turn": turn,
@@ -391,6 +279,8 @@ def main():
                     "score": score,
                     "done": done,
                     "won": won,
+                    "next_observation": obs.strip(),
+                    "memory_documents_snapshot": memory_snapshot,
                 })
                 g.total_reward += float(reward)
                 g.final_score = score
@@ -398,7 +288,6 @@ def main():
                 g.done = done or turn >= args.max_turns
                 g.num_turns = turn
 
-                # Append Qwen3 response to conversation
                 g.messages.append({"role": "assistant", "content": raw_response})
 
                 # Memory tracking
@@ -418,49 +307,16 @@ def main():
                             g.memory_documents = g.memory_documents[-g.max_memory_docs:]
                     g.current_segment = []
 
-                # Call GPT oracle on every turn that has memory documents
-                g.pending_oracle = bool(g.memory_documents and not g.done)
-                if g.pending_oracle:
-                    g.pending_oracle_obs = obs.strip()
-
-                # Finalize memory on game end
                 if g.done and g.current_segment:
                     doc = create_memory_document(g.current_segment)
                     if doc:
                         g.memory_documents.append(doc)
                     g.current_segment = []
 
-                # Add next observation to conversation if game continues
                 if not g.done:
                     g.messages.append({"role": "user", "content": obs.strip()})
 
-            # --- GPT oracle calls for games at memory steps ---
-            oracle_games = [g for g in active if g.pending_oracle]
-            if oracle_games:
-                with ThreadPoolExecutor(max_workers=args.gpt_workers) as pool:
-                    futures = {
-                        pool.submit(
-                            call_gpt_oracle,
-                            gpt_client,
-                            args.gpt_model,
-                            g,
-                            g.pending_oracle_obs,
-                        ): g
-                        for g in oracle_games
-                    }
-                    for future in as_completed(futures):
-                        g = futures[future]
-                        try:
-                            sample = future.result()
-                            g.oracle_samples.append(sample)
-                            all_oracle_samples.append(sample)
-                            total_oracle_calls += 1
-                        except Exception as e:
-                            print(f"    GPT oracle error for {g.game_id}: {e}")
-
-                        g.pending_oracle = False
-
-        # --- Save per-game transcripts ---
+        # Save transcripts
         for g in games:
             games_done += 1
             if g.won:
@@ -473,10 +329,9 @@ def main():
                 "final_score": g.final_score,
                 "total_reward": g.total_reward,
                 "num_turns": g.num_turns,
-                "num_oracle_samples": len(g.oracle_samples),
+                "memory_window": args.memory_window,
                 "num_memory_docs": len(g.memory_documents),
                 "turns": g.turns,
-                "oracle_samples": g.oracle_samples,
                 "memory_documents": g.memory_documents,
             }
             out_file = os.path.join(args.output_dir, f"{g.game_id}.json")
@@ -484,43 +339,268 @@ def main():
                 json.dump(transcript, f, indent=2)
 
             status = "WON" if g.won else f"score={g.final_score}"
-            oracle_str = f", {len(g.oracle_samples)} oracle" if g.oracle_samples else ""
             elapsed = time.time() - t_start
             rate = games_done / elapsed * 3600 if elapsed > 0 else 0
             print(f"  [{games_done}/{total_games}] {g.game_id}: {status} "
-                  f"({g.num_turns}t{oracle_str}) [{rate:.0f}/hr]")
+                  f"({g.num_turns}t, {len(g.memory_documents)} docs) [{rate:.0f}/hr]")
 
-    # --- Save combined oracle JSONL ---
-    oracle_file = os.path.join(args.output_dir, "oracle_samples.jsonl")
-    with open(oracle_file, "w") as f:
-        for sample in all_oracle_samples:
-            f.write(json.dumps(sample) + "\n")
-
-    # --- Summary ---
     elapsed = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"RESULTS ({total_games} games, {elapsed:.0f}s)")
+    print(f"STAGE 1 COMPLETE ({total_games} games, {elapsed:.0f}s)")
     print(f"  Win rate: {total_wins}/{total_games} ({100*total_wins/max(total_games,1):.1f}%)")
-    print(f"  Oracle calls: {total_oracle_calls}")
-    print(f"  Oracle samples saved: {oracle_file}")
-    print(f"  Rate: {total_games/elapsed*3600:.0f} games/hr")
+    print(f"  Transcripts saved to: {args.output_dir}")
+    print(f"\nNext: run stage2 from a node with internet access:")
+    print(f"  python play_textworld_hybrid.py stage2 --transcript_dir {args.output_dir}")
 
-    summary = {
-        "qwen3_model": args.model_path,
-        "gpt_model": args.gpt_model,
-        "data_file": args.data_file,
-        "num_games": total_games,
-        "wins": total_wins,
-        "win_rate": total_wins / max(total_games, 1),
-        "total_oracle_calls": total_oracle_calls,
-        "memory_window": args.memory_window,
-        "max_turns": args.max_turns,
-        "temperature": args.temperature,
-        "elapsed_seconds": elapsed,
+
+# ===================================================================
+# STAGE 2: GPT oracle annotates transcripts (needs internet)
+# ===================================================================
+
+def call_gpt_oracle(
+    client,
+    model: str,
+    game_id: str,
+    turn_num: int,
+    memory_documents: List[str],
+    conversation_history: List[Dict],
+    observation: str,
+) -> Dict[str, Any]:
+    """Call GPT API to predict best action at a given game state."""
+    memory_text = ""
+    if memory_documents:
+        memory_text = "\n\nMemory from previous turns:\n" + "\n\n---\n".join(memory_documents)
+
+    gpt_messages = [
+        {"role": "system", "content": GPT_ORACLE_SYSTEM_PROMPT + memory_text}
+    ]
+    gpt_messages.extend(conversation_history)
+    gpt_messages.append({"role": "user", "content": observation})
+
+    gpt_response = ""
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=gpt_messages,
+                temperature=1.0,
+                max_completion_tokens=4096,
+            )
+            gpt_response = response.choices[0].message.content or ""
+            if gpt_response:
+                break
+        except Exception as e:
+            last_error = e
+            print(f"    [GPT ERROR] {game_id} turn {turn_num} attempt {attempt+1}/3: {type(e).__name__}: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            continue
+    if not gpt_response:
+        if last_error:
+            print(f"    [GPT FAILED] {game_id} turn {turn_num}: all 3 attempts failed")
+        gpt_response = f"[ERROR: {last_error}]\n[ACTION: look]"
+
+    return {
+        "gpt_response": gpt_response,
+        "gpt_action": parse_action(gpt_response),
+        "prompt": gpt_messages,
     }
-    with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"  Summary: {os.path.join(args.output_dir, 'summary.json')}")
+
+
+def run_stage2(args):
+    """GPT oracle annotates Qwen3 transcripts with best-action predictions."""
+    from openai import OpenAI
+    client = OpenAI()
+
+    # Find transcript files
+    transcript_dir = args.transcript_dir
+    transcript_files = sorted(Path(transcript_dir).glob("game_*.json"))
+    if not transcript_files:
+        print(f"No transcript files found in {transcript_dir}")
+        return
+
+    if args.max_games:
+        transcript_files = transcript_files[:args.max_games]
+
+    print(f"GPT oracle: {args.gpt_model} (workers={args.gpt_workers})")
+    print(f"Transcripts: {len(transcript_files)} games in {transcript_dir}")
+    print("=" * 70)
+
+    all_oracle_samples = []
+    all_sft_samples = []
+    total_calls = 0
+    t_start = time.time()
+
+    for tf_idx, tf in enumerate(transcript_files):
+        with open(tf) as f:
+            transcript = json.load(f)
+
+        game_id = transcript["game_id"]
+        turns = transcript["turns"]
+
+        # Build oracle requests: every turn that has memory documents
+        oracle_requests = []
+        conversation_history = []
+
+        for turn_data in turns:
+            memory_docs = turn_data.get("memory_documents_snapshot", [])
+
+            if memory_docs and not turn_data.get("done", False):
+                oracle_requests.append({
+                    "game_id": game_id,
+                    "turn": turn_data["turn"],
+                    "memory_documents": memory_docs,
+                    "conversation_history": list(conversation_history),
+                    "observation": turn_data.get("next_observation", ""),
+                    "qwen3_action": turn_data["action"],
+                    "qwen3_response": turn_data.get("model_response", ""),
+                    "score": turn_data["score"],
+                    "reward": turn_data["reward"],
+                })
+
+            # Build up conversation history for subsequent turns
+            conversation_history.append({"role": "user", "content": turn_data["observation"]})
+            conversation_history.append({"role": "assistant", "content": f"[ACTION: {turn_data['action']}]"})
+
+        if not oracle_requests:
+            print(f"  [{tf_idx+1}/{len(transcript_files)}] {game_id}: 0 oracle turns (skipped)")
+            continue
+
+        # Call GPT in parallel
+        game_samples = []
+        with ThreadPoolExecutor(max_workers=args.gpt_workers) as pool:
+            futures = {}
+            for req in oracle_requests:
+                fut = pool.submit(
+                    call_gpt_oracle,
+                    client,
+                    args.gpt_model,
+                    req["game_id"],
+                    req["turn"],
+                    req["memory_documents"],
+                    req["conversation_history"],
+                    req["observation"],
+                )
+                futures[fut] = req
+
+            for fut in as_completed(futures):
+                req = futures[fut]
+                try:
+                    result = fut.result()
+                    sample = {
+                        "game_id": req["game_id"],
+                        "turn": req["turn"],
+                        "memory_documents": req["memory_documents"],
+                        "num_memory_docs": len(req["memory_documents"]),
+                        "prompt": result["prompt"],
+                        "gpt_response": result["gpt_response"],
+                        "gpt_action": result["gpt_action"],
+                        "qwen3_action": req["qwen3_action"],
+                        "qwen3_response": req["qwen3_response"],
+                        "score": req["score"],
+                        "reward": req["reward"],
+                        "game_won": transcript.get("won", False),
+                    }
+                    game_samples.append(sample)
+                    all_oracle_samples.append(sample)
+                    total_calls += 1
+
+                    # SFT-format sample with full conversation history
+                    if not result["gpt_response"].startswith("[ERROR"):
+                        memory_docs = req["memory_documents"]
+                        sys_prompt = QWEN_SYSTEM_PROMPT
+                        if memory_docs:
+                            memory_text = "\n\nMemory from previous turns:\n" + "\n\n---\n".join(memory_docs)
+                            sys_prompt = QWEN_SYSTEM_PROMPT + memory_text
+
+                        sft_messages = [{"role": "system", "content": sys_prompt}]
+                        sft_messages.extend(req["conversation_history"])
+                        sft_messages.append({"role": "user", "content": req["observation"]})
+                        sft_messages.append({"role": "assistant", "content": f"[ACTION: {result['gpt_action']}]"})
+
+                        sft_sample = {
+                            "messages": sft_messages,
+                            "game_id": req["game_id"],
+                            "turn": req["turn"],
+                            "source": "hybrid_oracle",
+                        }
+                        all_sft_samples.append(sft_sample)
+
+                except Exception as e:
+                    print(f"    GPT error for {req['game_id']} turn {req['turn']}: {e}")
+
+        # Update transcript with oracle samples
+        transcript["oracle_samples"] = sorted(game_samples, key=lambda s: s["turn"])
+        transcript["num_oracle_samples"] = len(game_samples)
+        with open(tf, "w") as f:
+            json.dump(transcript, f, indent=2)
+
+        elapsed = time.time() - t_start
+        valid = sum(1 for s in game_samples if not s["gpt_response"].startswith("[ERROR"))
+        print(f"  [{tf_idx+1}/{len(transcript_files)}] {game_id}: "
+              f"{valid}/{len(game_samples)} oracle OK "
+              f"({'WON' if transcript.get('won') else 'lost'}) "
+              f"[{(tf_idx+1)/elapsed*3600:.0f}/hr]")
+
+    # Save combined oracle JSONL
+    oracle_file = os.path.join(transcript_dir, "oracle_samples.jsonl")
+    with open(oracle_file, "w") as f:
+        for sample in sorted(all_oracle_samples, key=lambda s: (s["game_id"], s["turn"])):
+            f.write(json.dumps(sample) + "\n")
+
+    # Save SFT JSONL
+    sft_file = os.path.join(transcript_dir, "hybrid_sft.jsonl")
+    with open(sft_file, "w") as f:
+        for sample in all_sft_samples:
+            f.write(json.dumps(sample) + "\n")
+
+    elapsed = time.time() - t_start
+    valid_total = sum(1 for s in all_oracle_samples if not s["gpt_response"].startswith("[ERROR"))
+    print(f"\n{'=' * 70}")
+    print(f"STAGE 2 COMPLETE ({len(transcript_files)} games, {elapsed:.0f}s)")
+    print(f"  Oracle calls: {total_calls} ({valid_total} valid)")
+    print(f"  Oracle samples: {oracle_file}")
+    print(f"  SFT samples:    {sft_file} ({len(all_sft_samples)} samples)")
+
+
+# ===================================================================
+# CLI
+# ===================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Hybrid Qwen3 + GPT oracle data generation")
+    subparsers = parser.add_subparsers(dest="stage", required=True)
+
+    # Stage 1: Qwen3 plays
+    p1 = subparsers.add_parser("stage1", help="Qwen3 plays games on GPU (no internet needed)")
+    p1.add_argument("--data_file", type=str, required=True)
+    p1.add_argument("--output_dir", type=str, required=True)
+    p1.add_argument("--max_games", type=int, default=None)
+    p1.add_argument("--model_path", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    p1.add_argument("--max_turns", type=int, default=50)
+    p1.add_argument("--max_generate_length", type=int, default=256)
+    p1.add_argument("--temperature", type=float, default=0.6)
+    p1.add_argument("--top_p", type=float, default=0.95)
+    p1.add_argument("--batch_size", type=int, default=20)
+    p1.add_argument("--memory_window", type=int, default=5)
+    p1.add_argument("--max_memory_docs", type=int, default=20)
+    p1.add_argument("--seed", type=int, default=42)
+    p1.add_argument("--skip_existing", action="store_true")
+
+    # Stage 2: GPT oracle
+    p2 = subparsers.add_parser("stage2", help="GPT oracle annotates transcripts (needs internet)")
+    p2.add_argument("--transcript_dir", type=str, required=True)
+    p2.add_argument("--max_games", type=int, default=None)
+    p2.add_argument("--gpt_model", type=str, default="gpt-5-mini")
+    p2.add_argument("--gpt_workers", type=int, default=8)
+
+    args = parser.parse_args()
+
+    if args.stage == "stage1":
+        run_stage1(args)
+    elif args.stage == "stage2":
+        run_stage2(args)
 
 
 if __name__ == "__main__":

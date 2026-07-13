@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Play TextWorld games using OpenAI API to generate SFT/RL training data.
+Play TextWorld games using OpenAI API (GPT-5-mini) to generate expert trajectory data.
 
-Features:
-- Parallel game execution (--workers N)
-- Multiple samples per game (--n_samples N) for diverse trajectories
-- Saves per-game JSON + combined JSONL
+Uses FastTextWorldSimulator for speed (no Inform7 subprocess, no global lock).
+Outputs both per-game transcripts and SFT-formatted JSONL.
 
 Usage:
-    # Fast: 8 parallel games
-    python play_textworld_openai.py --data_file ~/data/textworld_memo/train.parquet --workers 8
+    # Quick test: 5 games
+    OPENAI_API_KEY=sk-... python play_textworld_openai.py \
+        --data_file ~/data/textworld_memo/train.parquet --max_games 5 --workers 4
 
-    # Multiple samples per game for RL data
-    python play_textworld_openai.py --data_file ~/data/textworld_memo/train.parquet --n_samples 3 --workers 8
-
-    # Quick test
-    python play_textworld_openai.py --data_file ~/data/textworld_memo/test.parquet --max_games 5 --workers 4
+    # Full run: all games
+    OPENAI_API_KEY=sk-... python play_textworld_openai.py \
+        --data_file /large_storage/.../tw_dataset_large/train.parquet \
+        --workers 8 --output_dir /path/to/output --skip_existing
 """
-
 from __future__ import annotations
 
 import argparse
@@ -25,7 +22,7 @@ import json
 import os
 import re
 import string
-import threading
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -33,10 +30,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
-import textworld
-from openai import OpenAI
 
-_TW_LOCK = threading.Lock()
+# Add skyrl-gym to path for FastTextWorldSimulator
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "skyrl-gym"))
+from skyrl_gym.envs.textworld.fast_sim import FastTextWorldSimulator
 
 
 SYSTEM_PROMPT = (
@@ -79,6 +76,14 @@ def parse_action(text: str) -> str:
     return parsed if parsed else "look"
 
 
+def resolve_game_json(game_file: str) -> str:
+    if game_file.endswith(".z8"):
+        return game_file[:-3] + ".json"
+    if game_file.endswith(".json"):
+        return game_file
+    return game_file + ".json"
+
+
 @dataclass
 class GameTranscript:
     game_file: str
@@ -93,55 +98,58 @@ class GameTranscript:
 
 
 def play_game(
-    client: OpenAI,
+    client,
     model: str,
     game_file: str,
     sample_id: int = 0,
     max_turns: int = 50,
-    temperature: float = 1.0,
 ) -> GameTranscript:
     game_id = Path(game_file).stem
     transcript = GameTranscript(game_file=game_file, game_id=game_id, sample_id=sample_id)
 
-    with _TW_LOCK:
-        env = textworld.start(game_file)
-    game_state = env.reset()
+    game_json = resolve_game_json(game_file)
+    sim = FastTextWorldSimulator(game_json)
+    obs, info = sim.reset()
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     transcript.messages = messages
 
     for turn in range(1, max_turns + 1):
-        obs = game_state.feedback.strip()
+        obs_text = obs.strip()
         if turn == 1:
-            user_msg = f"You start a new game.\n\n{obs}"
+            user_msg = f"You start a new game.\n\n{obs_text}"
         else:
-            user_msg = obs
+            user_msg = obs_text
 
         messages.append({"role": "user", "content": user_msg})
 
-        try:
-            api_kwargs = dict(
-                model=model,
-                messages=messages,
-                max_completion_tokens=1024,
-            )
-            if temperature != 1.0:
-                api_kwargs["temperature"] = temperature
-            response = client.chat.completions.create(**api_kwargs)
-            assistant_text = response.choices[0].message.content or ""
-        except Exception as e:
-            assistant_text = "[ACTION: look]"
+        assistant_text = ""
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_completion_tokens=1024,
+                )
+                assistant_text = response.choices[0].message.content or ""
+                if assistant_text:
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    assistant_text = "[ACTION: look]"
 
         action = parse_action(assistant_text)
         messages.append({"role": "assistant", "content": assistant_text})
 
-        game_state, reward, done = env.step(action)
-        score = getattr(game_state, "score", 0)
-        won = bool(done and getattr(game_state, "won", False))
+        obs, reward, done, step_info = sim.step(action)
+        score = step_info.get("score", 0)
+        won = step_info.get("won", False)
 
         transcript.turns.append({
             "turn": turn,
-            "observation": obs,
+            "observation": obs_text,
             "action": action,
             "model_response": assistant_text,
             "reward": float(reward),
@@ -154,10 +162,9 @@ def play_game(
         transcript.num_turns = turn
 
         if done:
-            transcript.won = won
+            transcript.won = bool(won)
             break
 
-    env.close()
     return transcript
 
 
@@ -179,19 +186,66 @@ def save_transcript(transcript: GameTranscript, output_dir: str, model: str):
         }, f, indent=2)
 
 
+def extract_sft(output_dir: str):
+    """Extract SFT-formatted JSONL from winning game transcripts.
+
+    Each SFT sample includes the full multi-turn conversation history
+    up to that point, so the model sees all prior context at training time.
+    """
+    sft_file = os.path.join(output_dir, "gpt_expert_sft.jsonl")
+    all_files = sorted(Path(output_dir).glob("game_*.json"))
+    sft_count = 0
+    win_count = 0
+
+    with open(sft_file, "w") as out:
+        for gf in all_files:
+            with open(gf) as fh:
+                data = json.load(fh)
+
+            if not data.get("won", False):
+                continue
+            win_count += 1
+
+            messages = data.get("messages", [])
+            # Build multi-turn SFT samples: for each assistant turn,
+            # include the full conversation history up to that point
+            for i in range(len(messages)):
+                if messages[i]["role"] == "assistant":
+                    action = parse_action(messages[i]["content"])
+                    # Include system + all prior turns + current turn
+                    sft_messages = []
+                    for msg in messages[:i]:
+                        sft_messages.append(msg)
+                    sft_messages.append({"role": "assistant", "content": f"[ACTION: {action}]"})
+
+                    sft_sample = {
+                        "messages": sft_messages,
+                        "game_id": data["game_id"],
+                        "turn": (i + 1) // 2,  # approximate turn number
+                        "source": "gpt_expert",
+                    }
+                    out.write(json.dumps(sft_sample) + "\n")
+                    sft_count += 1
+
+    print(f"SFT extraction: {win_count} winning games -> {sft_count} samples")
+    print(f"Saved: {sft_file}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Play TextWorld with OpenAI API")
+    parser = argparse.ArgumentParser(description="Play TextWorld with OpenAI API (GPT expert trajectories)")
     parser.add_argument("--data_file", type=str, required=True)
     parser.add_argument("--model", type=str, default="gpt-5-mini")
     parser.add_argument("--max_turns", type=int, default=50)
     parser.add_argument("--max_games", type=int, default=None)
-    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--n_samples", type=int, default=1, help="Samples per game (>1 for diverse trajectories)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel game threads")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--skip_existing", action="store_true", help="Skip games that already have output files")
+    parser.add_argument("--skip_existing", action="store_true")
     args = parser.parse_args()
+
+    from openai import OpenAI
+    client = OpenAI()
 
     df = pd.read_parquet(args.data_file)
     game_files = df["game_file"].unique().tolist()
@@ -201,9 +255,7 @@ def main():
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    client = OpenAI()
-
-    # Build work items: (game_file, sample_id)
+    # Build work items
     work = []
     for gf in game_files:
         for s in range(args.n_samples):
@@ -217,7 +269,7 @@ def main():
     total = len(work)
     print(f"Model: {args.model}")
     print(f"Games: {len(game_files)}, Samples/game: {args.n_samples}")
-    print(f"Total tasks: {total} ({total - len(work)} skipped)")
+    print(f"Total tasks: {total}")
     print(f"Workers: {args.workers}")
     print(f"Output: {args.output_dir or 'stdout only'}")
     print("=" * 70)
@@ -233,7 +285,6 @@ def main():
             game_file=game_file,
             sample_id=sample_id,
             max_turns=args.max_turns,
-            temperature=args.temperature,
         )
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -275,13 +326,16 @@ def main():
             "win_rate": wins / max(n, 1),
             "elapsed_seconds": elapsed,
             "max_turns": args.max_turns,
-            "temperature": args.temperature,
             "n_samples": args.n_samples,
             "workers": args.workers,
         }
         with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
 
+        # Extract SFT data from winning games
+        extract_sft(args.output_dir)
+
+        # Also write full transcripts JSONL
         jsonl_file = os.path.join(args.output_dir, "transcripts.jsonl")
         all_files = sorted(Path(args.output_dir).glob("game_*.json"))
         with open(jsonl_file, "w") as f:

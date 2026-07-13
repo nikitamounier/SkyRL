@@ -115,6 +115,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--gpu_memory", type=float, default=0.95)
+    parser.add_argument("--max_model_len", type=int, default=32768)
     parser.add_argument("--max_games", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=20)
     parser.add_argument("--output_file", type=str, default=None)
@@ -159,7 +160,7 @@ def main():
     llm = LLM(
         model=args.model_path,
         gpu_memory_utilization=args.gpu_memory,
-        max_model_len=32768,
+        max_model_len=args.max_model_len,
         dtype="bfloat16",
         seed=args.seed,
         trust_remote_code=True,
@@ -278,6 +279,7 @@ def main():
                 "total_reward": g.total_reward,
                 "num_turns": g.num_turns,
                 "num_memory_docs": len(g.memory_documents),
+                "messages": g.messages,  # full conversation (for trajectory inspection)
             }
             all_results.append(result)
             status = "WON" if g.won else f"score={g.final_score}"

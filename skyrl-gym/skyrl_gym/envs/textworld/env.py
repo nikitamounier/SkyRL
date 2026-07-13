@@ -121,6 +121,13 @@ class TextWorldEnv(BaseTextEnv):
         self.max_placeholder_tokens = int(
             self.extras.get("max_placeholder_tokens") or env_config.get("max_placeholder_tokens", 8)
         )
+        self.pool_mode = str(self.extras.get("pool_mode") or env_config.get("pool_mode", "standard"))
+        # When False, never build/inject memory documents or placeholder tokens
+        # (ICL-LoRA baseline: no memory module). Default True == MeMo behavior.
+        _em = self.extras.get("enable_memory")
+        if _em is None:
+            _em = env_config.get("enable_memory", True)
+        self.enable_memory = bool(_em)
 
         self._env = None
         self._game_state = None
@@ -215,6 +222,10 @@ class TextWorldEnv(BaseTextEnv):
         return parsed
 
     def _update_modalities_payload(self) -> None:
+        # No-memory baseline: never touch the system message or modality payload,
+        # so the rollout has zero placeholder tokens and no modality docs.
+        if not self.enable_memory:
+            return
         modalities_entry = self.extras.get("modalities")
         if modalities_entry is None or not hasattr(modalities_entry, "payloads"):
             return
@@ -238,8 +249,21 @@ class TextWorldEnv(BaseTextEnv):
                     f"{self._base_system_content}\n{placeholder_block}"
                 )
 
-            # Single occurrence containing all documents as one payload
-            modalities_entry.payloads[self.modality_id] = [docs_with_content] if docs_with_content else []
+            # Question-conditioned memory (adaptive, anchored, inverted, cosine_rag,
+            # rag_adaptive) needs the current observation as the query signal.
+            _QC_POOL_MODES = {
+                "adaptive", "anchored", "anchored_selector",
+                "inverted", "cosine_rag", "rag_adaptive", "ragadaptive",
+            }
+            if self.pool_mode in _QC_POOL_MODES and docs_with_content:
+                payload_item = {
+                    "documents": docs_with_content,
+                    "observation": self._last_observation,
+                }
+                modalities_entry.payloads[self.modality_id] = [payload_item]
+            else:
+                # Single occurrence containing all documents as one payload
+                modalities_entry.payloads[self.modality_id] = [docs_with_content] if docs_with_content else []
 
             plan = ModalityPlaceholderPlan(
                 modality_id=self.modality_id,

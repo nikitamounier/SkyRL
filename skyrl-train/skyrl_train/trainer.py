@@ -1221,8 +1221,17 @@ class RayPPOTrainer:
             )
             logger.info("Successfully loaded critic checkpoint")
 
-        # Ensure inference engines receive the restored projection weights.
-        ray.get(self.sync_policy_weights_to_inference_engines())
+        # NOTE: Do NOT broadcast weights to the inference engines here. On resume
+        # (colocate_all=True) the vLLM engine is still asleep at this point — no
+        # `wake_up(tags=["weights"])` has run yet and the policy model offload
+        # state is not set up — so a CUDA-IPC weight broadcast to the sleeping
+        # engine fails with "CUDA error: invalid argument".
+        # The restored weights (base model AND modality/projection weights) are
+        # synced correctly immediately after this returns, in `train()`, which
+        # offloads the optimizer, calls `wake_up(tags=["weights"])`, and then
+        # invokes `sync_policy_weights_to_inference_engines()`. That single sync
+        # covers the resume case fully, so an extra broadcast here is both
+        # premature and redundant.
 
         logger.info(f"Successfully loaded complete checkpoint state from global_step_{global_step}")
         return global_step

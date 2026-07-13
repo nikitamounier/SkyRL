@@ -567,8 +567,43 @@ class FSDPStrategy(DistributedStrategy):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with get_fsdp_state_ctx(load_model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
-                # Load model state dict
-                load_model.load_state_dict(model_state_dict, strict=load_module_strict)
+                # Load model state dict.
+                #
+                # When strict loading is requested we still want to be robust to
+                # *extra* keys that exist in an older checkpoint but no longer
+                # exist on the live model (for example, a lazily-loaded frozen
+                # embedding model that used to leak into the encoder state dict).
+                # Such keys are safe to drop because they are reloaded from disk
+                # / the HF hub on every run and are never trained. However, we
+                # must NEVER silently tolerate *missing* keys, since those would
+                # correspond to trainable (e.g. memory module) or base weights
+                # that we are supposed to restore.
+                if load_module_strict:
+                    live_keys = set(load_model.state_dict().keys())
+                    ckpt_keys = set(model_state_dict.keys())
+                    unexpected = ckpt_keys - live_keys
+                    missing = live_keys - ckpt_keys
+                    if missing:
+                        raise RuntimeError(
+                            f"[rank-{rank}]: Checkpoint is missing {len(missing)} key(s) "
+                            f"required by the model, refusing to load. "
+                            f"First few missing: {sorted(missing)[:10]}"
+                        )
+                    if unexpected:
+                        self.print(
+                            f"[rank-{rank}]: Dropping {len(unexpected)} stale checkpoint "
+                            f"key(s) not present in the current model (e.g. frozen, "
+                            f"non-trainable submodules). "
+                            f"First few: {sorted(unexpected)[:5]}"
+                        )
+                        model_state_dict = {
+                            k: v for k, v in model_state_dict.items() if k in live_keys
+                        }
+                    # All live keys are now guaranteed present; load strictly so
+                    # any remaining inconsistency (e.g. shape mismatch) still errors.
+                    load_model.load_state_dict(model_state_dict, strict=True)
+                else:
+                    load_model.load_state_dict(model_state_dict, strict=load_module_strict)
                 self.print(f"[rank-{rank}]: Successfully loaded model state dict")
 
                 # Load optimizer state dict if optimizer object is provided and loading is requested

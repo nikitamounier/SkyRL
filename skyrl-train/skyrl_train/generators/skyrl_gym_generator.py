@@ -86,6 +86,12 @@ class SkyRLGymGenerator(GeneratorInterface):
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn
         self.refresh_modalities_each_step = getattr(generator_cfg, "refresh_modalities_each_step", False)
+        # When True, each rollout step rebuilds input_ids as a fresh tokenization of
+        # [system_with_current_memory_pad, current_user_obs] — the LLM no longer sees
+        # accumulated chat history. The trainable memory module becomes the sole carrier
+        # of cross-turn state. The training trajectory at episode end is the LAST turn's
+        # (input, response) pair; the per-step rewards are summed into the trajectory.
+        self.memory_only_context = getattr(generator_cfg, "memory_only_context", False)
         # optionally use custom chat template to get loss masks (i.e. for Qwen3)
         self.custom_chat_template = get_custom_chat_template(generator_cfg.chat_template)
         # get generation prompt ids for the tokenizer if needed
@@ -330,6 +336,11 @@ class SkyRLGymGenerator(GeneratorInterface):
         rollout_logprobs = None
         # Accumulate per-step rewards. Format: (reward, response_end_token_idx)
         per_step_rewards: List[Tuple[float, Optional[int]]] = []
+        # When memory_only_context=True, we discard chat history each turn and
+        # collect intermediate per-step rewards into this running sum; the final
+        # trajectory will record one entry with the cumulative reward placed at
+        # the last turn's response.
+        pending_reward_sum: float = 0.0
 
         single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
         single_modalities_metadata: Optional[List[SampleModalityData]] = None
@@ -431,8 +442,18 @@ class SkyRLGymGenerator(GeneratorInterface):
                 output_ids = self.tokenizer.encode(output, add_special_tokens=False)
 
             # 3. Update states: input ids, loss_mask, chat_history, etc.
-            # Three ways of managing input
-            if retokenize_chat_history:
+            #
+            # MEMORY-ONLY CONTEXT short-circuit: when active, we will discard
+            # the accumulated per-turn history below and rebuild input_ids from
+            # `[env's current system message, new_obs]`. Skip the per-turn append
+            # paths entirely — appending then overwriting wastes a tokenization
+            # and pushes throwaway dicts into chat_history.
+            phase2_reset = self.memory_only_context and not done
+
+            if phase2_reset:
+                # Defer reward bookkeeping to the reset block below.
+                pass
+            elif retokenize_chat_history:
                 # a. We always re-tokenize the entire chat history every turn and at the end.
                 chat_history, chat_end_index, input_ids = self._get_next_input_ids_by_retokenizing_chat_history(
                     chat_history, chat_end_index, output, new_obs
@@ -445,6 +466,14 @@ class SkyRLGymGenerator(GeneratorInterface):
                     input_ids, loss_mask, output_ids, new_obs, done
                 )
                 per_step_rewards.append((step_reward, response_end_idx))
+            elif self.memory_only_context and done:
+                # Memory-only path, final turn: append normally and fold in the
+                # pending cross-turn reward below. We still need a real
+                # response_end_idx for advantage placement.
+                input_ids, loss_mask, response_end_idx = self._get_next_input_ids_with_multiturn_chat_template(
+                    input_ids, loss_mask, output_ids, new_obs, done
+                )
+                per_step_rewards.append((step_reward, response_end_idx))
             else:
                 # c. Token-in-token-out. All steps/observations are appended to a single assistant message.
                 loss_mask, input_ids, rollout_logprobs, response_end_idx = (
@@ -453,6 +482,69 @@ class SkyRLGymGenerator(GeneratorInterface):
                     )
                 )
                 per_step_rewards.append((step_reward, response_end_idx))
+
+            # MEMORY-ONLY CONTEXT — rebuild the LLM input from scratch each turn
+            # so it sees only [system_with_pad, new_obs]. The trainable memory
+            # module becomes the sole carrier of cross-turn state via the
+            # placeholder substitutions inside the system prompt.
+            if phase2_reset:
+                # Sum this turn's reward into the pending accumulator and drop
+                # any per-step rewards we just recorded — they belong to discarded
+                # turns. The final turn (when done=True) will hold the trajectory
+                # reward at its response_end_idx.
+                pending_reward_sum += step_reward
+                per_step_rewards = []
+
+                # The env owns the canonical, un-expanded system message (with
+                # the `<|image_pad|>` block re-written every step). Trusting
+                # `chat_history[0]` is unsafe: after the first reset, the
+                # multimodal processor returns shallow-copy dicts whose `content`
+                # has been post-expanded, breaking the alias to env._system_message.
+                if hasattr(env, "current_system_message"):
+                    fresh_system = env.current_system_message()
+                else:
+                    sys_src = chat_history[0] if chat_history else {"role": "system", "content": ""}
+                    fresh_system = {
+                        "role": sys_src.get("role", "system"),
+                        "content": sys_src.get("content", ""),
+                    }
+
+                # Include current-segment turns (turns since the last memory_window finalization)
+                # as raw user/assistant chat history. These turns are NOT yet in the memory
+                # tokens (they haven't reached memory_window yet), and NOT in the system prompt
+                # (we removed the [Memory recap] text block). Without this they'd be invisible
+                # to the LLM. Empty list when memory_window=1 (every turn finalizes immediately).
+                segment_msgs: ConversationType = []
+                if hasattr(env, "current_segment_chat_messages"):
+                    segment_msgs = env.current_segment_chat_messages() or []
+
+                fresh_messages: ConversationType = [fresh_system] + segment_msgs + list(new_obs)
+                fresh_input_ids, expanded_msgs = self._prepare_prompt_tokens(
+                    fresh_messages,
+                    env_extras,
+                    add_generation_prompt=not retokenize_chat_history,
+                    chat_template=self.custom_chat_template if retokenize_chat_history else None,
+                )
+                input_ids = fresh_input_ids
+                loss_mask = []
+                chat_history = list(expanded_msgs) if expanded_msgs is not fresh_messages else list(fresh_messages)
+                chat_end_index = len(chat_history)
+                initial_prompt_length = len(input_ids)
+                # Re-prime the per-step modality batch for the fresh input_ids.
+                single_modalities_batches = self._build_modalities_batches_for_envs([env_extras])
+                if single_modalities_batches:
+                    single_modalities_metadata = [self._collect_modalities_metadata(env_extras)]
+                else:
+                    single_modalities_metadata = None
+            elif self.memory_only_context and done:
+                # Final turn: fold accumulated cross-turn reward into the last
+                # entry's reward at its response_end_idx so the trainer sees a
+                # single (response, total-trajectory-reward) pair.
+                if per_step_rewards:
+                    last_reward, last_idx = per_step_rewards[-1]
+                    per_step_rewards[-1] = (last_reward + pending_reward_sum, last_idx)
+                else:
+                    per_step_rewards.append((pending_reward_sum + step_reward, None))
 
         # Get environment-specific metrics after the episode is done
         env_metrics = env.get_metrics()

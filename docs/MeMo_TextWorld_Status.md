@@ -1,6 +1,6 @@
 # MeMo TextWorld — Complete Project Reference
 
-> **Last updated**: Feb 9, 2026
+> **Last updated**: Feb 24, 2026
 > **Goal**: Train a Memory module (MeMo) for Qwen3-4B to improve TextWorld game performance using compressed memory of past gameplay turns.
 > **Status**: RL-only training failed (base model can't play). Pivoting to SFT on GPT-5-mini expert data, then Memory SFT, then RL.
 
@@ -219,17 +219,66 @@ RL training from scratch fundamentally limited by:
 - [x] Train Memory module with MeMo trainer (3 checkpoints: w3, w5, w10)
 - [x] Evaluate: **memory shows +3% on train set but hurts on val/test** (see eval results above)
 
-### Phase 3: RL Fine-tuning -- IN PROGRESS (Feb 10)
-- [x] Load Memory SFT checkpoints into SkyRL (fixed env, deps, dtype issues)
-- [x] Fix eval script to use proper SentenceTransformer encoding + EmbedsPrompt injection
-- [ ] 6 RL runs with constant LR: GRPO/R++ x w3/w5/w10 (running ~2h)
-- [ ] 6 RL runs with cosine scheduler: GRPO/R++ x w3/w5/w10 (running ~45min)
-- [ ] Compare: SFT-only vs SFT+RL vs baseline
+### Phase 3: RL Fine-tuning -- DONE (Feb 8-10)
+- [x] Phase 1: 7 RL runs from scratch (all trended DOWN — gradients exploded, mean norms 11K-15.5M)
+- [x] Phase 2: 12 RL runs from SFT checkpoint (8/12 improving, cosine LR stabilizes gradients)
+- [x] Best run: R++ w5 cosine (reward 0.42, grad norm 4.48, entropy 0.117)
 
-### Other TODO
-- [ ] Fix standalone eval script to properly inject memory embeddings (not just placeholder text)
-- [ ] Try loading MeMo personalization checkpoint as warm start
-- [ ] Experiment with LoRA on LLM (unfreeze partially) during RL
+### Phase 4: Alternative SFT Data Strategies -- DONE (Feb 23-24)
+
+Tested 5 approaches on the **same 10 original games** for fair comparison. All data at `/large_storage/goodarzilab/parsaidp/data_gen_test/`.
+
+#### Approach 1: GPT Expert Trajectories -- DONE
+- Script: `play_textworld_openai.py`
+- GPT-5-mini plays from scratch (no Qwen3 involvement)
+- **Result: 10/11 games won, 126 turn-samples**
+- Pros: High quality. Cons: Distribution shift (GPT visits different states than Qwen3)
+
+#### Approach 2: Hybrid Qwen3+GPT Oracle -- DONE
+- Script: `play_textworld_hybrid.py`
+- Stage 1: Qwen3 plays (5/10 won). Stage 2: GPT annotates every turn with privileged state
+- **Result: 242 oracle samples** (GPT sees walkthrough/map/inventory per turn)
+- Pros: On-distribution (Qwen3's states). Cons: Single-shot annotation per turn
+
+#### Approach 3: Qwen3 Behavioral Cloning -- DONE
+- Extracted from Qwen3's own winning trajectories (no GPT)
+- **Result: 5/10 won, 296 turn-samples total (41 from wins)**
+- Pros: Perfect distribution match. Cons: Only learns from Qwen3's limited wins
+
+#### Approach 4: DAgger with Privileged State -- DONE
+- Script: `play_textworld_dagger.py`
+- Stage 1: Qwen3 plays. Stage 2: GPT oracle annotates with walkthrough/map/inventory
+- **Result: 291 DAgger SFT samples** (all turns, win or lose)
+- Pros: On-distribution + expert labels + privileged info. Cons: Expensive (2 stages)
+
+#### Approach 5: GPT Continuation -- DONE (FIXED)
+- Script: `play_textworld_continuation.py`
+- Qwen3 plays first, GPT resumes from every 5th turn and plays to completion
+- Initial run: 0% win rate (bugs: missing API key in SLURM, history truncation dropped game objective, memory docs not passed to GPT)
+- **After fixes: 29/56 continuations won (51.8%), 80 SFT samples from wins**
+- Per-game: medium games ~90-100% win rate, hard games 0-60% win rate
+- Pros: On-distribution + verified quality (only keep wins). Cons: Slow (~30s/turn for reasoning model)
+
+#### Comparison Summary
+
+| Approach | Distribution | Quality Signal | Samples | Win Rate |
+|----------|-------------|----------------|---------|----------|
+| 1. GPT Expert | Off (GPT states) | Expert actions | 126 turns | 91% |
+| 2. Hybrid Oracle | On (Qwen states) | Expert + privileged | 242 turns | N/A |
+| 3. Qwen3 BC | On (Qwen states) | Qwen's own wins | 41 turns (wins) | 50% |
+| 4. DAgger | On (Qwen states) | Expert + privileged | 291 turns | N/A |
+| 5. Continuation | On (Qwen states) | Expert + verified wins | 80 turns (wins) | 51.8% |
+
+#### Large Game Dataset
+- [x] Generated 1,956 hard games (`/large_storage/goodarzilab/parsaidp/tw_games_large/`)
+- [x] Built benchmark (100 hard) + train (1,856 hard) parquets
+- Note: All games are hard (DIFFICULTY_MIX comma issue in sbatch --export)
+
+### TODO
+- [ ] Choose best SFT approach(es) and scale to full dataset (340+ games)
+- [ ] Train Memory SFT on selected data
+- [ ] Re-run RL Phase 2 from new SFT checkpoint
+- [ ] Evaluate on large benchmark (100 hard games)
 
 ### Completed
 - [x] All infrastructure fixes (vLLM, slurm, configs)
@@ -242,6 +291,13 @@ RL training from scratch fundamentally limited by:
 - [x] Baseline evals on all splits
 - [x] GPT-5-mini eval script with parallel workers
 - [x] Dataset v3 generation with new prompts
+- [x] Fast TextWorld simulator (`fast_sim.py` with `get_privileged_state()`)
+- [x] DAgger data collection pipeline (stage1 Qwen3, stage2 GPT oracle)
+- [x] GPT Continuation pipeline (fixed: game objective + memory docs + no resume_turn=0)
+- [x] Hybrid Qwen3+GPT Oracle pipeline
+- [x] All 5 SFT data approaches tested on same 10 games
+- [x] Large game dataset generation (1,956 hard games)
+- [x] SLURM .env management for OPENAI_API_KEY
 
 ---
 

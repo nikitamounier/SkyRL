@@ -1327,6 +1327,118 @@ class FastTextWorldSimulator:
         return self._match_entity(name_lower, candidates)
 
     # ------------------------------------------------------------------
+    # Privileged state (for DAgger / oracle annotations)
+    # ------------------------------------------------------------------
+
+    def get_privileged_state(self) -> Dict[str, Any]:
+        """Return a human-readable dict of the full internal game state.
+
+        Designed for DAgger-style data collection: an oracle model receives
+        this privileged info so it can give good advice even when the learner
+        is off the optimal path.
+        """
+        # Current room
+        room_info = self._infos.get(self._player_room, {})
+        player_room = room_info.get("name", self._player_room)
+
+        # Exits from current room (with door state if blocked)
+        exits: Dict[str, Any] = {}
+        for direction, dest_room in self._connections.get(self._player_room, {}).items():
+            dest_info = self._infos.get(dest_room, {})
+            dest_name = dest_info.get("name", dest_room)
+            door_id = (
+                self._door_links.get((self._player_room, dest_room))
+                or self._door_links.get((dest_room, self._player_room))
+            )
+            if door_id:
+                door_state = self._door_state.get(door_id, "open")
+                door_name = self._get_name(door_id)
+                exits[direction] = {
+                    "destination": dest_name,
+                    "door": door_name,
+                    "door_state": door_state,
+                }
+            else:
+                exits[direction] = {"destination": dest_name}
+
+        # Inventory
+        inventory = sorted(self._get_name(eid) for eid in self._inventory)
+
+        # Room objects: items on floor, containers (with state + contents), supporters
+        room_objects: List[Dict[str, Any]] = []
+        for obj_id, loc in self._obj_locations.items():
+            if loc != self._player_room:
+                continue
+            etype = self._get_type(obj_id)
+            obj_entry: Dict[str, Any] = {
+                "name": self._get_name(obj_id),
+                "type": etype,
+            }
+            if etype in ("o", "f", "k"):
+                # Portable object — note if it's on floor vs in/on something
+                if obj_id in self._obj_in_container:
+                    obj_entry["location"] = f"in {self._get_name(self._obj_in_container[obj_id])}"
+                elif obj_id in self._obj_on_supporter:
+                    obj_entry["location"] = f"on {self._get_name(self._obj_on_supporter[obj_id])}"
+                else:
+                    obj_entry["location"] = "floor"
+            elif etype == "c":
+                state = self._container_state.get(obj_id, "closed")
+                obj_entry["state"] = state
+                contents = [
+                    self._get_name(oid)
+                    for oid, cid in self._obj_in_container.items()
+                    if cid == obj_id
+                ]
+                obj_entry["contents"] = contents
+            elif etype == "s":
+                items_on = [
+                    self._get_name(oid)
+                    for oid, sid in self._obj_on_supporter.items()
+                    if sid == obj_id
+                ]
+                obj_entry["items_on"] = items_on
+            room_objects.append(obj_entry)
+
+        # Full room map: all room connections
+        room_map: Dict[str, Dict[str, str]] = {}
+        for room_id, conns in self._connections.items():
+            ri = self._infos.get(room_id, {})
+            room_name = ri.get("name", room_id)
+            room_map[room_name] = {}
+            for d, dest in conns.items():
+                di = self._infos.get(dest, {})
+                room_map[room_name][d] = di.get("name", dest)
+
+        # Key-lock pairs
+        key_locks: List[Dict[str, str]] = []
+        for key_id, lockable_id in self._key_matches.items():
+            key_locks.append({
+                "key": self._get_name(key_id),
+                "unlocks": self._get_name(lockable_id),
+            })
+
+        # Walkthrough from quest commands
+        walkthrough: List[str] = []
+        for quest in self._quests:
+            walkthrough.extend(quest.get("commands", []))
+
+        return {
+            "player_room": player_room,
+            "exits": exits,
+            "inventory": inventory,
+            "room_objects": room_objects,
+            "room_map": room_map,
+            "key_locks": key_locks,
+            "walkthrough": walkthrough,
+            "score": self._score,
+            "max_score": self._max_score,
+            "completed_quests": self._completed_quests,
+            "total_quests": len(self._quests),
+            "objective": self._objective,
+        }
+
+    # ------------------------------------------------------------------
     # Properties for external access
     # ------------------------------------------------------------------
 

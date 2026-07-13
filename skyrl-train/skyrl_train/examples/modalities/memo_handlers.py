@@ -102,16 +102,29 @@ def _maybe_add_memo_repo(memo_repo_root: Optional[str]) -> None:
                 return
 
 
-def _import_memo_memory(memo_repo_root: Optional[str]):
+def _import_memo_memory(memo_repo_root: Optional[str], pool_mode: str = "standard"):
+    """Import and return the appropriate memory class based on pool_mode."""
     _maybe_add_memo_repo(memo_repo_root)
     try:
-        from memo.models.memory import Memory  # type: ignore
+        from memo.models.memory import Memory, RefinedMemory, AdaptiveMemory, create_memory  # type: ignore
     except Exception as exc:  # pragma: no cover - import guard
         raise ImportError(
-            "Failed to import `memo.models.memory.Memory`. "
+            "Failed to import `memo.models.memory`. "
             "Set MEMO_REPO_ROOT or pass memo_repo_root in handler kwargs."
         ) from exc
-    return Memory
+    _MEMORY_CLASSES = {
+        "standard": Memory,
+        "refined": RefinedMemory,
+        "adaptive": AdaptiveMemory,
+    }
+    return _MEMORY_CLASSES.get(pool_mode, Memory)
+
+
+def _import_memo_create_memory(memo_repo_root: Optional[str]):
+    """Import the create_memory factory function."""
+    _maybe_add_memo_repo(memo_repo_root)
+    from memo.models.memory import create_memory  # type: ignore
+    return create_memory
 
 
 def _import_memo_embed(memo_repo_root: Optional[str]):
@@ -265,6 +278,9 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         num_layers: int = 1,
         dropout: float = 0.1,
         memory_init: str = "xavier_uniform",
+        pool_mode: str = "standard",
+        num_cross_attn_layers: int = 2,
+        projection_type: str = "linear",
         device: Optional[str] = None,
         dtype: Optional[str] = None,
         memo_repo_root: Optional[str] = None,
@@ -280,9 +296,11 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         super().__init__()
         self.modality_id = modality_id
         self.role = role
+        self.pool_mode = pool_mode
 
-        Memory = _import_memo_memory(memo_repo_root)
-        self.memory = Memory(
+        create_memory = _import_memo_create_memory(memo_repo_root)
+        self.memory = create_memory(
+            pool_mode=pool_mode,
             embedding_dim=embedding_dim,
             num_memories=num_memories,
             output_dim=output_dim,
@@ -290,6 +308,8 @@ class MemoMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             num_layers=num_layers,
             dropout=dropout,
             memory_init=memory_init,
+            num_cross_attn_layers=num_cross_attn_layers,
+            projection_type=projection_type,
         )
 
         # Store for validation
@@ -462,6 +482,9 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         num_layers: int = 1,
         dropout: float = 0.1,
         memory_init: str = "xavier_uniform",
+        pool_mode: str = "standard",
+        num_cross_attn_layers: int = 2,
+        projection_type: str = "linear",
         embedding_weight_names: Optional[Sequence[str]] = None,
         max_doc_tokens: int = 256,
         device: Optional[str] = None,
@@ -475,9 +498,11 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
         self.modality_id = modality_id
         self.role = role
         self.max_doc_tokens = int(max_doc_tokens)
+        self.pool_mode = pool_mode
 
-        Memory = _import_memo_memory(memo_repo_root)
-        self.memory = Memory(
+        create_memory = _import_memo_create_memory(memo_repo_root)
+        self.memory = create_memory(
+            pool_mode=pool_mode,
             embedding_dim=embedding_dim,
             num_memories=num_memories,
             output_dim=output_dim,
@@ -485,6 +510,8 @@ class MemoTokenMemoryEncoder(nn.Module, ModalityEncoderProtocol):
             num_layers=num_layers,
             dropout=dropout,
             memory_init=memory_init,
+            num_cross_attn_layers=num_cross_attn_layers,
+            projection_type=projection_type,
         )
 
         self.num_memories = num_memories
@@ -607,6 +634,7 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
     then passed through the Memory module to produce memory tokens.
 
     Payloads should be raw text strings (not token ids).
+    For adaptive mode, payloads should be dicts with "documents" and "observation" keys.
     """
 
     def __init__(
@@ -622,6 +650,9 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
         num_layers: int = 1,
         dropout: float = 0.1,
         memory_init: str = "xavier_uniform",
+        pool_mode: str = "standard",
+        num_cross_attn_layers: int = 2,
+        projection_type: str = "linear",
         embedding_device: str = "cpu",
         memo_repo_root: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
@@ -634,10 +665,12 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
         self.embedding_dim = embedding_dim
         self.num_memories = num_memories
         self.output_dim = output_dim
+        self.pool_mode = pool_mode
 
-        # Load the Memory module (same architecture as MeMo reference)
-        Memory = _import_memo_memory(memo_repo_root)
-        self.memory = Memory(
+        # Load the Memory module via factory
+        create_memory = _import_memo_create_memory(memo_repo_root)
+        self.memory = create_memory(
+            pool_mode=pool_mode,
             embedding_dim=embedding_dim,
             num_memories=num_memories,
             output_dim=output_dim,
@@ -645,6 +678,8 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
             num_layers=num_layers,
             dropout=dropout,
             memory_init=memory_init,
+            num_cross_attn_layers=num_cross_attn_layers,
+            projection_type=projection_type,
         )
 
         # Small-scale init the output projection to prevent step-1 gradient
@@ -652,14 +687,35 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
         # backward). Small random values (~0.01 scale) produce small non-zero
         # outputs that create gradient signal without destabilizing the LLM.
         if hasattr(self.memory, 'memory_projection'):
-            nn.init.normal_(self.memory.memory_projection.weight, mean=0.0, std=0.01)
-            if self.memory.memory_projection.bias is not None:
-                nn.init.zeros_(self.memory.memory_projection.bias)
+            proj = self.memory.memory_projection
+            # memory_projection can be nn.Linear or nn.Sequential (for MLP)
+            if isinstance(proj, nn.Linear):
+                nn.init.normal_(proj.weight, mean=0.0, std=0.01)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+            elif isinstance(proj, nn.Sequential):
+                # Init last linear layer in the MLP
+                for layer in reversed(list(proj.children())):
+                    if isinstance(layer, nn.Linear):
+                        nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
+                        break
 
         # Load embedding model on CPU to avoid GPU memory competition
         self._embedding_device = embedding_device
         self._embedding_model_name = embedding_model_name
-        self._embedding_model = None  # Lazy-load on first use
+        # IMPORTANT: hold the (frozen, lazily-loaded) SentenceTransformer inside a
+        # plain list so that `nn.Module.__setattr__` does NOT register it as a
+        # submodule. Otherwise, once it is lazy-loaded on the first `encode()`
+        # call, its ~2B frozen params (`_embedding_model.0.auto_model.*`) leak
+        # into this encoder's `state_dict()` and get written to checkpoints.
+        # On resume, `load_checkpoint` runs before any forward pass, so the fresh
+        # model has not lazy-loaded the embedder yet and its `state_dict()` lacks
+        # those keys -> `load_state_dict(strict=True)` raises "Unexpected key(s)".
+        # The embedding model is frozen and reloaded from the HF hub every run,
+        # so it must never participate in checkpointing.
+        self._embedding_model_holder: List[Any] = [None]  # Lazy-load on first use
 
         if checkpoint_path:
             loaded_params = _load_memory_checkpoint(
@@ -678,15 +734,20 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
                 )
 
     def _get_embedding_model(self):
-        """Lazy-load the SentenceTransformer model on first use."""
-        if self._embedding_model is None:
+        """Lazy-load the SentenceTransformer model on first use.
+
+        The model is stored inside ``self._embedding_model_holder`` (a plain
+        list) rather than as a direct attribute, so it is never registered as a
+        submodule and never leaks into ``state_dict()`` / checkpoints.
+        """
+        if self._embedding_model_holder[0] is None:
             from sentence_transformers import SentenceTransformer
             logger.info(
                 "Loading embedding model %s on %s",
                 self._embedding_model_name,
                 self._embedding_device,
             )
-            self._embedding_model = SentenceTransformer(
+            self._embedding_model_holder[0] = SentenceTransformer(
                 self._embedding_model_name,
                 model_kwargs={
                     "device_map": self._embedding_device,
@@ -694,17 +755,30 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
                 },
                 tokenizer_kwargs={"padding_side": "left"},
             )
-        return self._embedding_model
+        return self._embedding_model_holder[0]
 
     def encode(self, payloads: Sequence[Any]) -> Sequence[torch.Tensor]:
         """Encode payloads into memory tokens (batched).
 
         Batch-embeds all docs in one SentenceTransformer call, then runs
         a single padded Memory module forward pass.
+
+        For adaptive mode, uses mean-pooled document embeddings as the
+        question signal (no separate observation needed — docs already
+        contain the full context in TextWorld).
         """
         ref_param = next(self.memory.parameters(), None)
         device = ref_param.device if ref_param is not None else torch.device("cpu")
         dtype = ref_param.dtype if ref_param is not None else torch.bfloat16
+
+        # Question-conditioned memory (AdaptiveMemory, AnchoredSelectorMemory,
+        # InvertedAdaptiveMemory, CosineRAGMemory, RagAdaptive) takes a separate
+        # question signal. Detect by type so any current/future variant works.
+        try:
+            from memo.models.memory import QUESTION_CONDITIONED_MEMORY_TYPES
+            is_adaptive = isinstance(self.memory, QUESTION_CONDITIONED_MEMORY_TYPES)
+        except Exception:
+            is_adaptive = self.pool_mode == "adaptive"
 
         # Phase 1: resolve texts per payload
         all_texts: List[str] = []
@@ -755,7 +829,50 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
             idx_map.append(orig_idx)
 
         with torch.enable_grad():
-            memory_out, _ = self.memory(batch_embeds.detach(), padding_mask=padding_mask)
+            if is_adaptive:
+                # For AdaptiveMemory, use the last env observation as the
+                # question signal — "what am I looking at now?" conditions
+                # which past memory to surface.  If no observation text was
+                # provided in the payload, fall back to mean-pooled docs.
+                obs_texts_batch: List[str] = []
+                for orig_idx in idx_map:
+                    payload = payloads[orig_idx]
+                    obs = ""
+                    if isinstance(payload, dict):
+                        obs = payload.get("observation", "")
+                    obs_texts_batch.append(obs.strip() if isinstance(obs, str) else "")
+
+                has_obs = any(obs_texts_batch)
+                if has_obs:
+                    model = self._get_embedding_model()
+                    # Embed observations (use empty string fallback for missing)
+                    obs_to_embed = [o if o else "no observation" for o in obs_texts_batch]
+                    with torch.no_grad():
+                        obs_raw = model.encode(
+                            obs_to_embed, convert_to_numpy=False,
+                            show_progress_bar=False, device=self._embedding_device,
+                        )
+                    if isinstance(obs_raw, torch.Tensor):
+                        q_embeds = obs_raw.to(device=device, dtype=dtype)
+                    else:
+                        q_embeds = torch.stack([
+                            t.to(device=device, dtype=dtype) if isinstance(t, torch.Tensor)
+                            else torch.tensor(t, device=device, dtype=dtype) for t in obs_raw
+                        ])
+                else:
+                    # Fallback: mean-pooled document embeddings
+                    valid_mask = (~padding_mask).unsqueeze(-1).float()
+                    q_embeds = (batch_embeds * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+
+                # Return arity varies by architecture (AdaptiveMemory -> 3-tuple
+                # with gates; AnchoredSelectorMemory/others -> 2-tuple). Take [0].
+                memory_out = self.memory(
+                    batch_embeds.detach(),
+                    q_embeds.detach(),
+                    doc_padding_mask=padding_mask,
+                )[0]
+            else:
+                memory_out = self.memory(batch_embeds.detach(), padding_mask=padding_mask)[0]
 
         for batch_pos, orig_idx in enumerate(idx_map):
             outputs[orig_idx] = memory_out[batch_pos].to(dtype=dtype)
@@ -767,19 +884,25 @@ class MemoSentenceEmbeddingEncoder(nn.Module, ModalityEncoderProtocol):
 
         Payload can be:
         - List[str]: list of document texts (expected from env)
+        - dict: {"documents": [...], ...} (adaptive mode, extracts documents)
         - str: single document text
         - None/empty: no documents
         """
         if payload is None:
             return []
+        if isinstance(payload, dict):
+            docs = payload.get("documents", [])
+            if isinstance(docs, (list, tuple)):
+                return [t.strip() for t in docs if isinstance(t, str) and t.strip()]
+            elif isinstance(docs, str) and docs.strip():
+                return [docs.strip()]
+            return []
         if isinstance(payload, str):
             text = payload.strip()
             return [text] if text else []
         if isinstance(payload, (list, tuple)):
-            # List of strings (expected)
             if payload and isinstance(payload[0], str):
                 return [t.strip() for t in payload if isinstance(t, str) and t.strip()]
-            # List of ints (old token_ids format)
             if payload and isinstance(payload[0], int):
                 logger.warning(
                     "MemoSentenceEmbeddingEncoder received token_ids instead of text. "

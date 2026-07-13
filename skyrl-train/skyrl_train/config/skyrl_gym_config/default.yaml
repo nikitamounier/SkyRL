@@ -22,3 +22,15 @@ textworld:
   max_memory_docs: 4
   max_doc_tokens: 256
   memory_modality_id: "memo_memory"
+  # Declared here so they are overridable WITHOUT `+` (adding these as new keys
+  # to this existing block via `+` did not land -> env kept Python defaults:
+  # max_placeholder_tokens=8, pool_mode="standard").
+  max_placeholder_tokens: 8        # MUST equal modalities.memo_memory num_memories
+  placeholder_token: "<|image_pad|>"
+  pool_mode: "standard"            # standard|adaptive|anchored|inverted|cosine_rag|rag_adaptive
+  step_penalty: 0.0
+  efficiency_bonus: 0.0
+  # When false, the env never builds/injects memory documents or placeholder
+  # tokens (no modality payload). Used by the ICL-LoRA baseline (no memory
+  # module). Default true preserves the MeMo training behavior exactly.
+  enable_memory: true

@@ -10,27 +10,22 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=80G
 #
-# Test hybrid Qwen3 + GPT oracle data generation.
-# Qwen3 plays games via vLLM, GPT predicts best actions at memory steps.
+# Hybrid data gen: Qwen3 plays via vLLM + GPT oracle at memory steps.
 #
 # Usage:
-#   sbatch run_hybrid_test.slurm
-#   MAX_GAMES=10 sbatch run_hybrid_test.slurm
+#   OPENAI_API_KEY=sk-... sbatch run_hybrid_test.slurm
+#   OPENAI_API_KEY=sk-... MAX_GAMES=10 sbatch run_hybrid_test.slurm
 
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
 cd "${SLURM_SUBMIT_DIR:-$HOME/SkyRL}"
 
-# Activate venv (same as eval_textworld_baseline.slurm — skyenv has CUDA compat issues)
 export SKYRL_REPO_ROOT="${SKYRL_REPO_ROOT:-$HOME/SkyRL}"
 source "${SKYRL_REPO_ROOT}/skyrl-train/.venv/bin/activate"
 export PYTHONUNBUFFERED=1
-
-# Ensure skyrl-gym is importable
 export PYTHONPATH="${PYTHONPATH:-}:$HOME/SkyRL/skyrl-gym"
 
-# OpenAI API key — set yours here or export before sbatch
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
     echo "ERROR: OPENAI_API_KEY is not set."
     echo "Export it before submitting: OPENAI_API_KEY=sk-... sbatch run_hybrid_test.slurm"
@@ -48,7 +43,7 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/data/hybrid_test_output}"
 
 echo "========================================="
-echo "Hybrid Data Gen Test (Qwen3 + GPT Oracle)"
+echo "Hybrid Data Gen (Qwen3 + GPT Oracle)"
 echo "  Data:          $DATA_FILE"
 echo "  Qwen3 model:   $MODEL_PATH"
 echo "  GPT oracle:    $GPT_MODEL"
@@ -60,25 +55,31 @@ echo "  GPT workers:   $GPT_WORKERS"
 echo "  Output:        $OUTPUT_DIR"
 echo "========================================="
 
-python skyrl-train/examples/MeMo/play_textworld_hybrid.py \
+# Stage 1: Qwen3 plays
+python skyrl-train/examples/MeMo/play_textworld_hybrid.py stage1 \
     --data_file "$DATA_FILE" \
     --model_path "$MODEL_PATH" \
-    --gpt_model "$GPT_MODEL" \
     --memory_window "$MEMORY_WINDOW" \
     --max_turns "$MAX_TURNS" \
     --max_games "$MAX_GAMES" \
     --batch_size "$BATCH_SIZE" \
-    --gpt_workers "$GPT_WORKERS" \
     --output_dir "$OUTPUT_DIR"
 
 echo ""
-echo "========================================="
-echo "Hybrid test complete"
-echo "========================================="
-echo "Output: $OUTPUT_DIR"
+echo "Stage 1 done. Running Stage 2 (GPT oracle)..."
 echo ""
 
-# Show quick summary
+# Stage 2: GPT oracle annotates
+python skyrl-train/examples/MeMo/play_textworld_hybrid.py stage2 \
+    --transcript_dir "$OUTPUT_DIR" \
+    --gpt_model "$GPT_MODEL" \
+    --gpt_workers "$GPT_WORKERS"
+
+echo ""
+echo "========================================="
+echo "All done. Output: $OUTPUT_DIR"
+echo "========================================="
+
 if [[ -f "$OUTPUT_DIR/summary.json" ]]; then
     echo "Summary:"
     cat "$OUTPUT_DIR/summary.json"
@@ -89,5 +90,5 @@ if [[ -f "$OUTPUT_DIR/oracle_samples.jsonl" ]]; then
     NSAMPLES=$(wc -l < "$OUTPUT_DIR/oracle_samples.jsonl")
     echo "Oracle samples: $NSAMPLES"
     echo "First sample:"
-    head -1 "$OUTPUT_DIR/oracle_samples.jsonl" | python -m json.tool
+    head -1 "$OUTPUT_DIR/oracle_samples.jsonl" | python -m json.tool 2>/dev/null || head -1 "$OUTPUT_DIR/oracle_samples.jsonl"
 fi

@@ -26,6 +26,11 @@ EFFICIENCY_BONUS="${EFFICIENCY_BONUS:-0.0}"
 MEMO_REPO_ROOT="${MEMO_REPO_ROOT:-$HOME/MeMo}"
 MAX_TURNS="${MAX_TURNS:-50}"
 
+# Memory architecture (standard, refined, adaptive)
+POOL_MODE="${POOL_MODE:-standard}"
+NUM_CROSS_ATTN_LAYERS="${NUM_CROSS_ATTN_LAYERS:-2}"
+PROJECTION_TYPE="${PROJECTION_TYPE:-linear}"
+
 # Training
 LR="${LR:-5.0e-4}"
 RUN_NAME="${RUN_NAME:-textworld_memo_$(date +%Y%m%d_%H%M%S)}"
@@ -34,6 +39,26 @@ ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
 N_SAMPLES="${N_SAMPLES:-5}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
 MEMORY_CHECKPOINT="${MEMORY_CHECKPOINT:-}"
+
+# --- Memory vs. ICL-LoRA baseline toggle ---
+# USE_MEMORY=1 (default): train the MeMo memory module on a frozen decoder
+#                         (modality block injected, freeze_base_model=true,
+#                          lora.rank=0). Behavior identical to before.
+# USE_MEMORY=0          : NO memory module / no modality injection. Train a LoRA
+#                         adapter on the decoder instead (freeze_base_model=false,
+#                          lora.rank=$LORA_RANK), full ICL chat history in prompt.
+USE_MEMORY="${USE_MEMORY:-1}"
+if [[ "$USE_MEMORY" == "0" ]]; then
+  LORA_RANK="${LORA_RANK:-128}"        # ~264M trainable on Qwen3-4B all-linear
+  LORA_ALPHA="${LORA_ALPHA:-$LORA_RANK}"
+  FREEZE_BASE="${FREEZE_BASE:-false}"  # PEFT freezes base; adapters stay trainable
+  TARGET_MODULES="${TARGET_MODULES:-all-linear}"
+else
+  LORA_RANK="${LORA_RANK:-0}"
+  LORA_ALPHA="${LORA_ALPHA:-16}"
+  FREEZE_BASE="${FREEZE_BASE:-true}"
+  TARGET_MODULES="${TARGET_MODULES:-all-linear}"
+fi
 
 # Load W&B API key from file if not set
 if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.wandb_api_key" ]]; then
@@ -54,6 +79,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKYRL_TRAIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Use whatever env the slurm script activated (skyenv or .venv)
 
+# Build the memory-modality block ONLY when USE_MEMORY=1. For the ICL-LoRA
+# baseline (USE_MEMORY=0) we pass no `+modalities.*` (so cfg.modalities stays {})
+# and disable env-side placeholder injection via enable_memory=false.
+MODALITY_ARGS=()
+if [[ "$USE_MEMORY" == "1" ]]; then
+  MODALITY_ARGS=(
+    environment.skyrl_gym.textworld.enable_memory=true
+    +modalities.memo_memory.placeholder_token="'$PLACEHOLDER_TOKEN'"
+    +modalities.memo_memory.max_placeholder_tokens=$NUM_MEMORIES
+    +modalities.memo_memory.encoder.target="skyrl_train.examples.modalities.memo_handlers:MemoSentenceEmbeddingEncoder"
+    +modalities.memo_memory.encoder.kwargs.embedding_model_name="Qwen/Qwen3-Embedding-4B"
+    +modalities.memo_memory.encoder.kwargs.embedding_dim=$MEMORY_DIM
+    +modalities.memo_memory.encoder.kwargs.output_dim=$MEMORY_DIM
+    +modalities.memo_memory.encoder.kwargs.num_memories=$NUM_MEMORIES
+    +modalities.memo_memory.encoder.kwargs.num_heads=8
+    +modalities.memo_memory.encoder.kwargs.num_layers=1
+    +modalities.memo_memory.encoder.kwargs.dropout=0.1
+    +modalities.memo_memory.encoder.kwargs.memory_init="xavier_uniform"
+    +modalities.memo_memory.encoder.kwargs.pool_mode="$POOL_MODE"
+    +modalities.memo_memory.encoder.kwargs.num_cross_attn_layers=$NUM_CROSS_ATTN_LAYERS
+    +modalities.memo_memory.encoder.kwargs.projection_type="$PROJECTION_TYPE"
+    +modalities.memo_memory.encoder.kwargs.embedding_device="${EMBEDDING_DEVICE:-cuda}"
+    +modalities.memo_memory.encoder.kwargs.memo_repo_root="$MEMO_REPO_ROOT"
+    +modalities.memo_memory.projection.target="skyrl_train.examples.modalities.memo_handlers:IdentityProjection"
+    +modalities.memo_memory.projection.kwargs={}
+    +modalities.memo_memory.trainable.encoder=true
+    +modalities.memo_memory.trainable.projection=true
+  )
+  if [[ -n "$MEMORY_CHECKPOINT" ]]; then
+    MODALITY_ARGS+=(
+      +modalities.memo_memory.encoder.kwargs.checkpoint_path="$MEMORY_CHECKPOINT"
+      +modalities.memo_memory.encoder.kwargs.checkpoint_prefix=""
+    )
+  fi
+else
+  # No memory module: disable env-side placeholder/document injection.
+  MODALITY_ARGS=( environment.skyrl_gym.textworld.enable_memory=false )
+fi
+
+echo "USE_MEMORY=$USE_MEMORY FREEZE_BASE=$FREEZE_BASE LORA_RANK=$LORA_RANK LORA_ALPHA=$LORA_ALPHA TARGET_MODULES=$TARGET_MODULES"
+
 python -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
@@ -64,10 +130,11 @@ python -m skyrl_train.entrypoints.main_base \
   environment.skyrl_gym.textworld.max_memory_docs=$MAX_MEMORY_DOCS \
   environment.skyrl_gym.textworld.max_doc_tokens=256 \
   environment.skyrl_gym.textworld.memory_modality_id="memo_memory" \
-  +environment.skyrl_gym.textworld.step_penalty=$STEP_PENALTY \
-  +environment.skyrl_gym.textworld.efficiency_bonus=$EFFICIENCY_BONUS \
-  +environment.skyrl_gym.textworld.placeholder_token="'$PLACEHOLDER_TOKEN'" \
-  +environment.skyrl_gym.textworld.max_placeholder_tokens=$NUM_MEMORIES \
+  environment.skyrl_gym.textworld.step_penalty=$STEP_PENALTY \
+  environment.skyrl_gym.textworld.efficiency_bonus=$EFFICIENCY_BONUS \
+  environment.skyrl_gym.textworld.placeholder_token="'$PLACEHOLDER_TOKEN'" \
+  environment.skyrl_gym.textworld.max_placeholder_tokens=$NUM_MEMORIES \
+  environment.skyrl_gym.textworld.pool_mode="$POOL_MODE" \
   generator.max_turns=$MAX_TURNS \
   generator.batched=false \
   generator.refresh_modalities_each_step=true \
@@ -76,8 +143,10 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.algorithm.advantage_estimator="$ADVANTAGE_ESTIMATOR" \
   trainer.algorithm.use_kl_loss=false \
   trainer.policy.model.path="$MODEL_PATH" \
-  trainer.policy.model.freeze_base_model=true \
-  trainer.policy.model.lora.rank=0 \
+  trainer.policy.model.freeze_base_model=$FREEZE_BASE \
+  trainer.policy.model.lora.rank=$LORA_RANK \
+  trainer.policy.model.lora.alpha=$LORA_ALPHA \
+  trainer.target_modules="$TARGET_MODULES" \
   trainer.placement.colocate_all=true \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
@@ -108,23 +177,5 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.run_name="$RUN_NAME" \
   trainer.resume_mode="$RESUME_MODE" \
   trainer.ckpt_path="$CKPT_DIR" \
-  +modalities.memo_memory.placeholder_token="'$PLACEHOLDER_TOKEN'" \
-  +modalities.memo_memory.max_placeholder_tokens=$NUM_MEMORIES \
-  +modalities.memo_memory.encoder.target="skyrl_train.examples.modalities.memo_handlers:MemoSentenceEmbeddingEncoder" \
-  +modalities.memo_memory.encoder.kwargs.embedding_model_name="Qwen/Qwen3-Embedding-4B" \
-  +modalities.memo_memory.encoder.kwargs.embedding_dim=$MEMORY_DIM \
-  +modalities.memo_memory.encoder.kwargs.output_dim=$MEMORY_DIM \
-  +modalities.memo_memory.encoder.kwargs.num_memories=$NUM_MEMORIES \
-  +modalities.memo_memory.encoder.kwargs.num_heads=8 \
-  +modalities.memo_memory.encoder.kwargs.num_layers=1 \
-  +modalities.memo_memory.encoder.kwargs.dropout=0.1 \
-  +modalities.memo_memory.encoder.kwargs.memory_init="xavier_uniform" \
-  +modalities.memo_memory.encoder.kwargs.embedding_device="${EMBEDDING_DEVICE:-cuda}" \
-  +modalities.memo_memory.encoder.kwargs.memo_repo_root="$MEMO_REPO_ROOT" \
-  ${MEMORY_CHECKPOINT:++modalities.memo_memory.encoder.kwargs.checkpoint_path="$MEMORY_CHECKPOINT"} \
-  ${MEMORY_CHECKPOINT:++modalities.memo_memory.encoder.kwargs.checkpoint_prefix=""} \
-  +modalities.memo_memory.projection.target="skyrl_train.examples.modalities.memo_handlers:IdentityProjection" \
-  +modalities.memo_memory.projection.kwargs={} \
-  +modalities.memo_memory.trainable.encoder=true \
-  +modalities.memo_memory.trainable.projection=true \
+  "${MODALITY_ARGS[@]}" \
   "$@"

@@ -101,6 +101,20 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         if self.cfg.generator.weight_sync_backend == "nccl" and self.cfg.trainer.placement.colocate_all:
             self.use_cuda_ipc = True
 
+        # Log trainable parameter count (rank 0) so LoRA / memory-module runs can
+        # be compared on a like-for-like trainable-param budget.
+        try:
+            if torch.distributed.get_rank() == 0:
+                _trainable = sum(p.numel() for p in self.model.model.parameters() if p.requires_grad)
+                _total = sum(p.numel() for p in self.model.model.parameters())
+                print(
+                    f"[trainable-params] trainable={_trainable:,} ({_trainable/1e6:.1f}M) "
+                    f"total={_total:,} ({_total/1e6:.1f}M) lora_rank={self.cfg.trainer.policy.model.lora.rank}",
+                    flush=True,
+                )
+        except Exception as _e:
+            print(f"[trainable-params] count failed: {_e}", flush=True)
+
     async def _save_lora_adapters_and_sync(self, peft_model, lora_sync_path, inference_engine_client):
         """Collect LoRA parameters, save and call inference engine to load."""
         import os
