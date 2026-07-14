@@ -65,6 +65,10 @@ class MultimodalPromptProcessor:
             tokenize=True,
             **tokenization_kwargs,
         )
+        # transformers 5.x returns a BatchEncoding (dict) from apply_chat_template(tokenize=True);
+        # 4.x returned a plain list of token ids. Normalise to a flat list of ids.
+        if hasattr(token_ids, "input_ids"):
+            token_ids = token_ids["input_ids"]
         attention_mask = [1] * len(token_ids)
 
         embedding_spans: Dict[str, List[ModalityEmbeddingSpan]] = {}

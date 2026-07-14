@@ -96,6 +96,11 @@ def get_generation_prompt_ids(tokenizer) -> List[int]:
     empty_user_with_generation_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": ""}], add_generation_prompt=True, tokenize=True
     )
+    # transformers 5.x returns a BatchEncoding from apply_chat_template(tokenize=True); 4.x a list.
+    if hasattr(empty_user, "input_ids"):
+        empty_user = empty_user["input_ids"]
+    if hasattr(empty_user_with_generation_prompt, "input_ids"):
+        empty_user_with_generation_prompt = empty_user_with_generation_prompt["input_ids"]
 
     generation_prompt_ids = empty_user_with_generation_prompt[len(empty_user) :]
     return generation_prompt_ids

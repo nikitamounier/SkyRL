@@ -47,7 +47,7 @@ python -m skyrl_train.entrypoints.main_base \
   generator.inference_engine_tensor_parallel_size=1 \
   trainer.epochs=1 \
   trainer.eval_batch_size=32 \
-  trainer.eval_before_train=true \
+  trainer.eval_before_train=false \
   trainer.eval_interval=5 \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size=16 \
@@ -57,7 +57,7 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.ckpt_interval=50 \
   trainer.max_prompt_length=16384 \
   generator.sampling_params.max_generate_length=1024 \
-  generator.sampling_params.temperature=0.0 \
+  generator.sampling_params.temperature=1.0 \
   trainer.policy.optimizer_config.lr=1.0e-6 \
   trainer.algorithm.use_kl_loss=true \
   generator.backend=$INFERENCE_BACKEND \

@@ -146,8 +146,10 @@ class CellProjection(nn.Module, ModalityProjectorProtocol):
 
     def project(self, features: torch.Tensor) -> torch.Tensor:
         # features: (num_latents, embedding_dim) -> (num_latents, output_dim).
-        weight_dtype = self.mlp[0].weight.dtype
-        return self.mlp(features.to(dtype=weight_dtype))
+        # Match the projection's device+dtype: in the training forward the encoded
+        # features arrive on CPU while the projection lives on the GPU.
+        weight = self.mlp[0].weight
+        return self.mlp(features.to(device=weight.device, dtype=weight.dtype))
 
 
 __all__ = ["StatePrecomputedEncoder", "CellProjection"]
