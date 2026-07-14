@@ -194,7 +194,7 @@ class RemoteInferenceEngine(InferenceEngineInterface):
                 "Remote inference engines do not support CUDA IPC weight updates. Only local engines support IPC."
             )
         if self.engine_backend == "vllm":
-            weight_update_method = "update_weights"
+            weight_update_method = "skyrl_update_weights"
         elif self.engine_backend == "sglang":
             weight_update_method = "update_weights_from_distributed"
         else:

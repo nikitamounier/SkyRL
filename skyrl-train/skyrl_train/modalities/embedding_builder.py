@@ -16,6 +16,8 @@ class PromptEmbeddingBuilder:
     DEFAULT_EMBEDDING_NAMES = (
         "model.embed_tokens.weight",
         "model.wte.weight",
+        # qwen3.5 (Qwen3_5ForConditionalGeneration) nests the text embedding here
+        "language_model.model.embed_tokens.weight",
     )
 
     def __init__(

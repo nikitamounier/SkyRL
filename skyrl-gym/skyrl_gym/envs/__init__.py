@@ -46,3 +46,8 @@ register(
     id="fast_textworld",
     entry_point="skyrl_gym.envs.textworld.fast_env:FastTextWorldEnv",
 )
+
+register(
+    id="cell_pathway",
+    entry_point="skyrl_gym.envs.cell_pathway.env:CellPathwayEnv",
+)

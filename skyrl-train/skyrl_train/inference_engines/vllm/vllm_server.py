@@ -106,7 +106,7 @@ class VllmServer:
             dtypes = [data.get("dtype")]
             shapes = [data.get("shape")]
             await engine.collective_rpc(
-                "update_weights",
+                "skyrl_update_weights",
                 args=(names, dtypes, shapes),
             )
             return {"status": "ok"}

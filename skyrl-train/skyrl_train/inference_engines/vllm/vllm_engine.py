@@ -9,17 +9,35 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt, EmbedsPrompt
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-    ErrorInfo,
-    CompletionRequest,
-    CompletionResponse,
-)
+# vLLM reorganised `entrypoints.openai` into per-endpoint packages around 0.16.
+# Support both layouts so this engine runs on vLLM 0.11 (MeMo/TextWorld) and
+# 0.19+ (the qwen3.5 cell-RL stack). These symbols are only used by the async
+# OpenAI-HTTP path; the batched GRPO path uses TokensPrompt/EmbedsPrompt only.
+try:  # vLLM >= ~0.16 layout
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+    from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.entrypoints.openai.completion.protocol import (
+        CompletionRequest,
+        CompletionResponse,
+    )
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse, ErrorInfo
+except ImportError:  # vLLM <= ~0.13 flat layout
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+    from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+    from vllm.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ErrorResponse,
+        ErrorInfo,
+        CompletionRequest,
+        CompletionResponse,
+    )
 from vllm.lora.request import LoRARequest
 from torch.distributed import destroy_process_group
 from skyrl_train.distributed.utils import init_custom_process_group
@@ -118,7 +136,7 @@ class WorkerWrap:
             f"rank={rank}, world_size={world_size}, group_name={group_name}",
         )
 
-    def update_weights(self, names: List[str], dtypes: List[str], shapes: List[List[int]]):
+    def skyrl_update_weights(self, names: List[str], dtypes: List[str], shapes: List[List[int]]):
         """Broadcast weight to all vllm workers from source rank 0 (actor model)"""
         modality_weights = []
         weight_list = []
@@ -192,6 +210,28 @@ class WorkerWrap:
             warnings.warn("No model update group to destroy")
             return
         destroy_process_group(self._model_update_group)
+
+
+def _apply_bioreason_vllm_overrides(kwargs: dict) -> None:
+    """In-place: translate BioReasonCell/qwen3.5 flags into vLLM engine kwargs.
+
+    ``disable_mrope=True`` -> an ``hf_overrides`` callable that strips M-RoPE from
+    the config so ``prompt_embeds`` work (M-RoPE needs prompt_token_ids, which are
+    mutually exclusive with prompt_embeds). ``language_model_only`` passes straight
+    through to vLLM (skips the vision tower / multimodal image processor). Both are
+    no-ops for plain text models, so this is safe for the MeMo path too.
+    """
+    if kwargs.pop("disable_mrope", False) and "hf_overrides" not in kwargs:
+
+        def _disable_mrope(cfg):
+            text_cfg = getattr(cfg, "text_config", cfg)
+            rope = getattr(text_cfg, "rope_parameters", None)
+            if rope and isinstance(rope, dict):
+                rope.pop("mrope_section", None)
+                rope.pop("mrope_interleaved", None)
+            return cfg
+
+        kwargs["hf_overrides"] = _disable_mrope
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
@@ -507,6 +547,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                 "Pipeline parallelism is only supported with AsyncVLLMInferenceEngine. "
                 "Please set `generator.async_engine=true` in your config."
             )
+        _apply_bioreason_vllm_overrides(kwargs)
         return vllm.LLM(*args, **kwargs)
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
@@ -622,7 +663,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                 len(request["names"]) == 1
             ), f"Update weights without cuda IPC only supports a single named weight at a time , got request with {len(request['names'])} entries"
             result = await asyncio.to_thread(
-                engine.collective_rpc, "update_weights", args=(request["names"], request["dtypes"], request["shapes"])
+                engine.collective_rpc, "skyrl_update_weights", args=(request["names"], request["dtypes"], request["shapes"])
             )
             await self._maybe_refresh_prompt_embeddings(request["names"])
             self._apply_local_modalities_weights(request)
@@ -803,7 +844,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 len(request["names"]) == 1
             ), f"Update weights without cuda IPC only supports a single named weight at a time , got request with {len(request['names'])} entries"
             result = await engine.collective_rpc(
-                "update_weights",
+                "skyrl_update_weights",
                 args=(
                     request["names"],
                     request["dtypes"],

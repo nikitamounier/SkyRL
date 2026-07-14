@@ -243,7 +243,10 @@ class FSDPStrategy(DistributedStrategy):
                 model.model if is_wrapped else model,
                 cpu_offload=cpu_offload,
                 param_init_fn=init_fn,
-                use_orig_params=False,
+                # use_orig_params=True tolerates mixed requires_grad within a flat
+                # param (LoRA-frozen base + trainable adapters/modality projection)
+                # and keeps original param names for the named-weight sync.
+                use_orig_params=True,
                 auto_wrap_policy=wrap_policy,
                 device_id=torch.cuda.current_device(),
                 sharding_strategy=sharding_strategy,
