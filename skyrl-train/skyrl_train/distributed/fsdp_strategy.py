@@ -51,6 +51,18 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+def _make_modality_grad_allreduce_hook(group):
+    """Post-accumulate-grad hook: average a replicated modality param's grad across the
+    data-parallel group so all ranks apply the same update (FSDP doesn't sync ignored params)."""
+    import torch.distributed as dist
+
+    def _hook(param):
+        if param.grad is not None and dist.is_initialized() and dist.get_world_size(group) > 1:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=group)
+
+    return _hook
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -233,6 +245,18 @@ class FSDPStrategy(DistributedStrategy):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        # Keep the small modality modules (encoder/projection) OUT of FSDP sharding:
+        # they are invoked outside the FSDP forward (in prepare_inputs_embeds), so their
+        # weights must stay full 2-D on every rank. They are replicated (each rank loads
+        # the same cell_projection.pt), and we all-reduce their grads below so they train
+        # in sync. Small (~25M) so replication is cheap.
+        _mod_root = model.model if is_wrapped else model
+        ignored_modules = []
+        for _attr in ("_skyrl_modality_encoders", "_skyrl_modality_projections"):
+            _mod = getattr(_mod_root, _attr, None)
+            if _mod is not None and any(True for _ in _mod.parameters()):
+                ignored_modules.append(_mod)
+
         # Wrap model with FSDP
         if self.fsdp_strategy == "fsdp":
             # cpu offloading will always be none for models that train with FSDP due to correctness issues with gradient accumulation -
@@ -254,7 +278,19 @@ class FSDPStrategy(DistributedStrategy):
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
+                ignored_modules=ignored_modules or None,
             )
+            # FSDP does not move/sync ignored (replicated) modality params. Put them on
+            # the local GPU and, for trainable ones, all-reduce grads across the DP group
+            # so every rank applies the same projection update.
+            if ignored_modules:
+                _dev = torch.cuda.current_device()
+                _group = self.device_mesh.get_group() if self.device_mesh is not None else None
+                for _mod in ignored_modules:
+                    _mod.to(_dev)
+                    for _p in _mod.parameters():
+                        if _p.requires_grad:
+                            _p.register_post_accumulate_grad_hook(_make_modality_grad_allreduce_hook(_group))
         elif self.fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(

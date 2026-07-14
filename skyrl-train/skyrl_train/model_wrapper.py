@@ -388,11 +388,14 @@ class HFModelWrapper(nn.Module):
         except ImportError:
             pass
 
-        # FSDP1 Check: Storage size 0 (Sharded)
-        if hasattr(embedding_layer, "weight") and embedding_layer.weight.storage().size() == 0:
-            # Try gathering params.
-            # We use self.model (the HF model) as the root for summoning.
-            # This will summon all params in self.model.
+        # FSDP1 Check: sharded weight. With use_orig_params=False a sharded param has
+        # storage size 0; with use_orig_params=True (needed for LoRA + modality) the local
+        # shard is a 1-D tensor (non-zero storage), so also gather whenever the weight is
+        # not the full 2-D (vocab, hidden) matrix.
+        if hasattr(embedding_layer, "weight") and (
+            embedding_layer.weight.storage().size() == 0 or embedding_layer.weight.dim() != 2
+        ):
+            # Summon full params on self.model (the HF root) so the embedding weight is 2-D.
             with FSDP.summon_full_params(self.model, writeback=False):
                 return embedding_layer(input_ids)
 
