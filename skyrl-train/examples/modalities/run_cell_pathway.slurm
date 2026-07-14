@@ -29,6 +29,7 @@ mkdir -p "$HF_HOME"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export DATA_DIR="${DATA_DIR:-$HOME/data/cell_pathway_v7_5}"
 export MODEL_PATH="${MODEL_PATH:-/large_storage/goodarzilab/bioreason_cell/checkpoints/sft_gene_pathway_v7_5_50k_full_answeronly_9b_converted}"

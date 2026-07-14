@@ -67,7 +67,7 @@ python -m skyrl_train.entrypoints.main_base \
   generator.batched=true \
   environment.env_class=cell_pathway \
   generator.n_samples_per_prompt=5 \
-  generator.gpu_memory_utilization=0.85 \
+  generator.gpu_memory_utilization=0.45 \
   generator.enforce_eager=true \
   +generator.engine_init_kwargs.language_model_only=true \
   +generator.engine_init_kwargs.disable_mrope=true \

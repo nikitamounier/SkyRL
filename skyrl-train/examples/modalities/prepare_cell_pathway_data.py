@@ -48,7 +48,7 @@ def build_sample(row: Dict[str, Any], idx: int, split: str, embed_vec: List[floa
         "data_source": "wanglab/BioReasonCell-ExperimentData",
         "prompt": [{"role": "user", "content": content}],
         "env_class": "cell_pathway",
-        "reward_spec": {"method": "rule", "ground_truth": gt},
+        "reward_spec": {"method": "rule", "ground_truth": gt, "format_bonus": 0.0},
         "extra_info": {
             "split": split,
             "index": idx,
