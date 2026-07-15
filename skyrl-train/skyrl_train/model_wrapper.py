@@ -395,6 +395,25 @@ class HFModelWrapper(nn.Module):
         if hasattr(embedding_layer, "weight") and (
             embedding_layer.weight.storage().size() == 0 or embedding_layer.weight.dim() != 2
         ):
+            # If the embedding is frozen (e.g. LoRA base), gather the full weight ONCE and
+            # cache it, instead of summon_full_params on the whole model every micro-batch
+            # (an ~18GB spike that fragments memory and is slow). Falls back to per-call
+            # summon when the embedding is trainable (cache would go stale).
+            if not embedding_layer.weight.requires_grad:
+                cached = getattr(self, "_cached_full_embed_weight", None)
+                if cached is None:
+                    with FSDP.summon_full_params(self.model, writeback=False):
+                        cached = embedding_layer.weight.detach().to(input_ids.device).clone()
+                    self._cached_full_embed_weight = cached
+                return F.embedding(
+                    input_ids,
+                    cached,
+                    padding_idx=embedding_layer.padding_idx,
+                    max_norm=embedding_layer.max_norm,
+                    norm_type=embedding_layer.norm_type,
+                    scale_grad_by_freq=embedding_layer.scale_grad_by_freq,
+                    sparse=embedding_layer.sparse,
+                )
             # Summon full params on self.model (the HF root) so the embedding weight is 2-D.
             with FSDP.summon_full_params(self.model, writeback=False):
                 return embedding_layer(input_ids)

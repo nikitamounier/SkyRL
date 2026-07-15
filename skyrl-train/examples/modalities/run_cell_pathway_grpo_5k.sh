@@ -38,8 +38,8 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size=64 \
   trainer.policy_mini_batch_size=16 \
-  trainer.micro_forward_batch_size_per_gpu=2 \
-  trainer.micro_train_batch_size_per_gpu=1 \
+  trainer.micro_forward_batch_size_per_gpu=16 \
+  trainer.micro_train_batch_size_per_gpu=4 \
   trainer.ckpt_interval=40 \
   trainer.max_prompt_length=8192 \
   generator.sampling_params.max_generate_length=512 \
@@ -53,8 +53,9 @@ python -m skyrl_train.entrypoints.main_base \
   generator.batched=true \
   environment.env_class=cell_pathway \
   generator.n_samples_per_prompt=16 \
-  generator.gpu_memory_utilization=0.5 \
+  generator.gpu_memory_utilization=0.45 \
   generator.enforce_eager=true \
+  +generator.engine_init_kwargs.max_model_len=12288 \
   +generator.engine_init_kwargs.language_model_only=true \
   +generator.engine_init_kwargs.disable_mrope=true \
   trainer.logger="$LOGGER" \
