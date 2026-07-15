@@ -178,6 +178,10 @@ def create_ray_wrapped_inference_engines(
                     num_cpus=num_gpus_per_actor,
                     num_gpus=num_gpus_per_actor,
                     scheduling_strategy=dp_rank_sched,
+                    # Override PYTORCH_CUDA_ALLOC_CONF off inside vLLM actors: expandable_segments
+                    # (set globally to defragment the FSDP training process) is incompatible with
+                    # vLLM's sleep-mode CuMemAllocator used under colocation.
+                    runtime_env={"env_vars": {"PYTORCH_CUDA_ALLOC_CONF": ""}},
                 ).remote(
                     model=pretrain,
                     enforce_eager=enforce_eager,

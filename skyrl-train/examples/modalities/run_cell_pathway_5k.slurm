@@ -27,6 +27,7 @@ mkdir -p "$HF_HOME"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # W&B -> goodarzilab team
 export WANDB_API_KEY="$(cat "$HOME/.wandb_api_key")"
