@@ -3,6 +3,7 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import os
 from typing import List, Optional, Tuple, Union
 from copy import deepcopy
 
@@ -127,14 +128,29 @@ class HFModelWrapper(nn.Module):
             else:
                 model_class = AutoModelForCausalLM
 
-            self.model = model_class.from_pretrained(
+            self.model, _loading_info = model_class.from_pretrained(
                 pretrain_or_model,
                 trust_remote_code=True,
                 attn_implementation=self.attn_implementation,
                 quantization_config=nf4_config,
                 torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                 device_map=device_map,
+                output_loading_info=True,
             )
+
+            # BioReasonCell/Qwen3.5 checkpoints were saved with the old Qwen-VL key layout
+            # (``language_model.model.*``); transformers>=5 expects ``model.language_model.*``.
+            # from_pretrained then silently matches ZERO transformer weights and returns a
+            # RANDOMLY-INITIALIZED model (uniform logits, no usable gradient) -- while vLLM's
+            # tolerant loader reads the same checkpoint fine, so only training is broken. Detect
+            # the mismatch and reload the raw checkpoint with remapped keys.
+            _missing = _loading_info.get("missing_keys", []) if isinstance(_loading_info, dict) else []
+            _core_missing = any(
+                (".layers." in k and any(s in k for s in ("self_attn", "linear_attn", "mlp", "input_layernorm")))
+                for k in _missing
+            )
+            if isinstance(pretrain_or_model, str) and _core_missing:
+                self._remap_and_reload_legacy_qwen_vl(pretrain_or_model)
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):
@@ -362,6 +378,55 @@ class HFModelWrapper(nn.Module):
         action_mask[:, 0] = 1
 
         return sequences, attention_mask, action_mask
+
+    def _remap_and_reload_legacy_qwen_vl(self, ckpt_path: str):
+        """Reload a checkpoint saved with the legacy Qwen-VL key layout.
+
+        Old checkpoints name the language model ``language_model.model.*`` and the vision tower
+        ``visual.*``; transformers>=5 expects ``model.language_model.*`` / ``model.visual.*``. We
+        read the raw tensors, remap the keys, and copy them into the (otherwise randomly-init'd)
+        model. Verified to restore correct outputs (entropy ~1.6, sane greedy tokens).
+        """
+        import glob
+        from safetensors.torch import load_file
+
+        # Determine where THIS model expects the decoder to live. AutoModelForCausalLM resolves
+        # Qwen3.5 to the text-only Qwen3_5ForCausalLM (model.layers.*); the multimodal
+        # ForConditionalGeneration uses model.language_model.layers.*. Target whichever exists.
+        _param_names = [n for n, _ in self.model.named_parameters()]
+        if any(n.startswith("model.language_model.layers.") for n in _param_names):
+            lm_prefix, vis_prefix = "model.language_model.", "model.visual."
+        else:
+            lm_prefix, vis_prefix = "model.", "visual."
+
+        def _remap(k: str) -> str:
+            if k.startswith("language_model.model."):
+                return lm_prefix + k[len("language_model.model.") :]
+            if k.startswith("language_model."):
+                return lm_prefix + k[len("language_model.") :]
+            if k.startswith("visual."):
+                return vis_prefix + k[len("visual.") :]
+            return k
+
+        raw = {}
+        for f in sorted(glob.glob(os.path.join(ckpt_path, "*.safetensors"))):
+            raw.update(load_file(f))
+        if not raw:
+            for f in sorted(glob.glob(os.path.join(ckpt_path, "*.bin"))):
+                raw.update(torch.load(f, map_location="cpu"))
+
+        remapped = {_remap(k): v for k, v in raw.items()}
+        missing, unexpected = self.model.load_state_dict(remapped, strict=False)
+        lm_missing = [k for k in missing if "language_model." in k]
+        logger.info(
+            f"[qwen-vl key-remap] reloaded {len(remapped)} tensors from {ckpt_path}; "
+            f"residual missing={len(missing)} (language-model missing={len(lm_missing)}), "
+            f"unexpected={len(unexpected)} (unused vision keys are expected)"
+        )
+        assert not lm_missing, (
+            f"legacy Qwen-VL key remap failed: {len(lm_missing)} language-model weights still "
+            f"unmatched (e.g. {lm_missing[:3]}) -> training model would stay randomly initialized."
+        )
 
     def _safe_get_embeddings(self, embedding_layer, input_ids):
         import torch.distributed as dist
@@ -710,6 +775,20 @@ class HFModelWrapper(nn.Module):
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
+
+        if getattr(self, "_dbg_fwd_count", 0) < 3:
+            self._dbg_fwd_count = getattr(self, "_dbg_fwd_count", 0) + 1
+            with torch.no_grad():
+                _lg = logits_BSV.detach().float()
+                _ie = inputs_embeds_fwd.detach().float() if inputs_embeds_fwd is not None else None
+                _ie_absmean = _ie.abs().mean().item() if _ie is not None else float("nan")
+                _last = _lg.reshape(-1, _lg.shape[-1])[-1]
+                logger.info(
+                    f"[fwd-dbg] temperature={float(temperature):.4f} "
+                    f"inputs_embeds_absmean={_ie_absmean:.5f} "
+                    f"logits_std={_lg.std().item():.4f} logits_absmean={_lg.abs().mean().item():.4f} "
+                    f"last_tok_logit_range={(_last.max() - _last.min()).item():.3f}"
+                )
 
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(

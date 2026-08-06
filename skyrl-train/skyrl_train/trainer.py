@@ -810,18 +810,41 @@ class RayPPOTrainer:
         if self.cfg.generator.sampling_params.logprobs is not None:
             # calculates the difference in probs between inference and trainer components
             # only consider response tokens
-            logprobs_diff = (
-                training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
-                - action_log_probs[training_input["loss_mask"] > 0]
-            )
+            rollout_lp = training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
+            train_lp = action_log_probs[training_input["loss_mask"] > 0]
+            logprobs_diff = rollout_lp - train_lp
             prob_diff = logprobs_diff.exp().abs()
             prob_diff_mean = prob_diff.mean().item()
             prob_diff_std = prob_diff.std().item()
+            # Robust log-space stats: the exp()-mean above is outlier-dominated and not a reliable
+            # on-policy readout. mean/median |Δlogprob| directly measure inference-vs-training weight
+            # consistency (~0 => the two stacks compute identical distributions => true on-policy).
+            abs_ld = logprobs_diff.abs().float()
+            abs_diff_mean = abs_ld.mean().item()
+            abs_diff_median = abs_ld.median().item() if abs_ld.numel() else 0.0
+            abs_diff_p90 = torch.quantile(abs_ld, 0.9).item() if abs_ld.numel() else 0.0
+            frac_gt1 = (abs_ld > 1.0).float().mean().item() if abs_ld.numel() else 0.0
             self.all_metrics.update(
                 {
                     "policy/rollout_train_prob_diff_mean": prob_diff_mean,
                     "policy/rollout_train_prob_diff_std": prob_diff_std,
+                    "policy/rollout_train_logprob_abs_diff_mean": abs_diff_mean,
+                    "policy/rollout_train_logprob_abs_diff_median": abs_diff_median,
+                    "policy/rollout_train_logprob_abs_diff_p90": abs_diff_p90,
+                    "policy/rollout_train_logprob_frac_gt1": frac_gt1,
                 }
+            )
+            logger.info(
+                f"[on-policy check] logprob |Δ|: mean={abs_diff_mean:.4f} median={abs_diff_median:.4f} "
+                f"p90={abs_diff_p90:.4f} frac(|Δ|>1)={frac_gt1:.3f}  (exp-mean={prob_diff_mean:.1f})"
+            )
+            _rl = rollout_lp.float()
+            _tl = train_lp.float()
+            logger.info(
+                f"[on-policy check] rollout_lp: mean={_rl.mean().item():.4f} "
+                f"sample={[round(x,3) for x in _rl[:6].tolist()]} | "
+                f"train_lp: mean={_tl.mean().item():.4f} "
+                f"sample={[round(x,3) for x in _tl[:6].tolist()]}"
             )
         return training_input
 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Dict, List
 
 import ray
@@ -123,10 +124,17 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         from safetensors.torch import save_file
         from skyrl_train.distributed.fsdp_utils import collect_lora_params
 
+        import shutil
+
         lora_params = collect_lora_params(module=self.model.model)
 
         if torch.distributed.get_rank() == 0:
-            os.makedirs(lora_sync_path, exist_ok=True)
+            # Write each sync to a UNIQUE directory. vLLM can cache a parsed adapter by its disk
+            # path, so reusing one path serves the first (step-0, empty) weights forever -> frozen
+            # rollout. A fresh path every step forces vLLM to re-parse the current weights.
+            self._lora_sync_counter = getattr(self, "_lora_sync_counter", 0) + 1
+            step_dir = os.path.join(lora_sync_path, f"v{self._lora_sync_counter}")
+            os.makedirs(step_dir, exist_ok=True)
 
             peft_config = asdict(peft_model.peft_config.get("default", {}))
             peft_config["task_type"] = peft_config["task_type"].value
@@ -134,19 +142,153 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             peft_config["target_modules"] = list(peft_config["target_modules"])
 
             # Save LoRA parameters and config
-            save_file(lora_params, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with io.open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+            save_file(lora_params, os.path.join(step_dir, "adapter_model.safetensors"))
+            with io.open(os.path.join(step_dir, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(peft_config, f, ensure_ascii=False, indent=4)
 
             # Send LoRA disk loading request to inference engine. `lora_disk_load` is a specific identifier
             # to tell the inference engine to extract the `lora_disk_path`.
             lora_request = {
                 "names": ["lora_disk_load"],
-                "extras": [{"lora_disk_path": lora_sync_path}],
+                "extras": [{"lora_disk_path": step_dir}],
             }
             await inference_engine_client.update_named_weights(lora_request)
 
+            # clean up the previous step's directory to avoid unbounded disk growth
+            prev_dir = os.path.join(lora_sync_path, f"v{self._lora_sync_counter - 1}")
+            if os.path.isdir(prev_dir):
+                shutil.rmtree(prev_dir, ignore_errors=True)
+
         torch.distributed.barrier()
+
+    async def _merge_lora_into_base_and_broadcast(self, peft_model, inference_engine_client, generator_dtype):
+        """Bake the LoRA delta into the base weights and push the merged weights into vLLM's BASE model.
+
+        vLLM does NOT apply LoRA on the ``prompt_embeds`` generation path we use to inject the cell
+        embedding, so the synced adapter never affected rollouts (frozen base-model rollout, identical
+        rewards across LRs). Only LoRA-target weights change during LoRA training; the rest of the base
+        is already correct in vLLM from the checkpoint load, so we merge + broadcast just those tensors.
+        """
+        import math
+
+        cfg = peft_model.peft_config["default"]
+        scaling = cfg.lora_alpha / (math.sqrt(cfg.r) if getattr(cfg, "use_rslora", False) else cfg.r)
+        adapter = "default"
+        sd = self.model.model.state_dict()
+        rank0 = torch.distributed.get_rank() == 0
+        device = torch.cuda.current_device()
+
+        def clean(name):
+            # strip FSDP / activation-checkpoint / PEFT wrapper prefixes -> base HF param name
+            for tok in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "base_model.model."):
+                name = name.replace(tok, "")
+            return name
+
+        def to_vllm(train_name):
+            # text-only training names (model.*) -> multimodal checkpoint names (language_model.model.*)
+            return ("language_model." + train_name) if train_name.startswith("model.") else train_name
+
+        def full(t):
+            t = t.to(device, non_blocking=True)
+            return t.full_tensor() if isinstance(t, DTensor) else t
+
+        target_bases = [k for k in sd if k.endswith(".base_layer.weight")]
+        if rank0 and not getattr(self, "_merge_logged", False):
+            self._merge_logged = True
+            sample = target_bases[0] if target_bases else None
+            tn = clean(sample) if sample else None
+            print(
+                f"[lora-merge] {len(target_bases)} target weights; scaling={scaling:.4f}; "
+                f"sample {sample} -> vllm={to_vllm(tn) if tn else None}",
+                flush=True,
+            )
+
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        world_size = torch.distributed.get_world_size()
+
+        def compute_merged(base_key, a_key, b_key):
+            # Gather full (collective across all training ranks) then merge on the full tensors.
+            # NOTE: full() is a collective — it must run on ALL ranks, never inside an `if rank0`
+            # guard, or the collective desyncs and NCCL aborts. Norms are computed here (all ranks)
+            # and only logged on rank 0.
+            Wf = full(sd[base_key]).float()
+            delta = scaling * (full(sd[b_key]).float() @ full(sd[a_key]).float())
+            merged = (Wf + delta).to(generator_dtype)
+            return merged, Wf.norm().item(), delta.norm().item()
+
+        for base_key in target_bases:
+            prefix = base_key[: -len("base_layer.weight")]
+            a_key = f"{prefix}lora_A.{adapter}.weight"
+            b_key = f"{prefix}lora_B.{adapter}.weight"
+            if a_key not in sd or b_key not in sd:
+                if rank0:
+                    print(f"[lora-merge] missing lora A/B for {base_key}; skipping", flush=True)
+                continue
+            # Keep the ".base_layer.weight" suffix: vLLM is ALSO LoRA-wrapped, so its params_dict
+            # keys are e.g. "...gate_proj.base_layer.weight". vLLM's stacked mapping then rewrites
+            # gate_proj->gate_up_proj / q_proj->qkv_proj on this name and finds the fused base_layer.
+            vllm_name = to_vllm(clean(base_key))
+
+            if self.use_cuda_ipc:
+                # Colocated mode: a training rank and a vLLM engine share a physical GPU, so an NCCL
+                # broadcast group would see a duplicate GPU. Share the merged tensor via CUDA IPC
+                # handles instead (same mechanism the non-LoRA colocated path uses). Await the send so
+                # the merged tensor stays alive until vLLM has reconstructed it from the handle.
+                merged, wnorm, dnorm = compute_merged(base_key, a_key, b_key)
+                merged = merged.detach().contiguous()
+                if rank0 and base_key == target_bases[0] and getattr(self, "_delta_logged", 0) < 5:
+                    self._delta_logged = getattr(self, "_delta_logged", 0) + 1
+                    print(
+                        f"[lora-merge] delta check {clean(base_key)}: |W|={wnorm:.3f} "
+                        f"|delta|={dnorm:.4f} |merged|={merged.float().norm().item():.3f}",
+                        flush=True,
+                    )
+                ipc_handle = {get_physical_gpu_id(): reduce_tensor(merged)}
+                handle_list = [None] * world_size
+                torch.distributed.all_gather_object(handle_list, ipc_handle)
+                if torch.distributed.get_rank() == 0:
+                    handles = {}
+                    for d in handle_list:
+                        handles.update(d)
+                    await inference_engine_client.update_named_weights(
+                        {
+                            "names": [vllm_name],
+                            "dtypes": [self.cfg.generator.model_dtype],
+                            "shapes": [list(merged.shape)],
+                            "extras": [{"ipc_handles": handles}],
+                        }
+                    )
+                torch.distributed.barrier()
+                torch.cuda.synchronize()
+                del merged
+                if torch.distributed.get_rank() == 0:
+                    torch.cuda.ipc_collect()
+            else:
+                # Non-colocated: NCCL broadcast. Send the update RPC as a task and run the gather+
+                # broadcast in a thread so the event loop can deliver the RPC concurrently (else the
+                # collective deadlocks).
+                merged_shape = list(sd[base_key].shape)
+                if torch.distributed.get_rank() == 0:
+                    update_weight_task = asyncio.create_task(
+                        inference_engine_client.update_named_weights(
+                            {
+                                "names": [vllm_name],
+                                "dtypes": [self.cfg.generator.model_dtype],
+                                "shapes": [merged_shape],
+                            }
+                        )
+                    )
+
+                def gather_merge_broadcast():
+                    merged, _, _ = compute_merged(base_key, a_key, b_key)
+                    if torch.distributed.get_rank() == 0:
+                        torch.distributed.broadcast(merged.data, 0, group=self._model_update_group)
+
+                await asyncio.to_thread(gather_merge_broadcast)
+                if torch.distributed.get_rank() == 0:
+                    await update_weight_task
+                torch.distributed.barrier()
 
     async def broadcast_to_inference_engines(self, inference_engine_client):
         use_prefix_cache = self.cfg.generator.enable_prefix_caching
@@ -167,13 +309,36 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # Check if this is a LoRA model
         peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
 
+        # Whether to also sync the co-trained modality projector to the inference engine on the
+        # LoRA path. This MUST happen whenever the projector is trainable: otherwise vLLM keeps a
+        # stale projector (Proj_0) while FSDP recomputes with the live one (Proj_t), producing a
+        # train/rollout logprob divergence that GROWS over training (measured ~30% of the tail
+        # growth on the overfit hook run). The previous env-var gate (SKYRL_SYNC_MODALITY_UNDER_LORA)
+        # never reliably reached the Ray worker, so the trained projector silently never synced.
+        # Gate on ACTUAL trainability (known from the model, robust to env propagation).
+        # Kill-switch SKYRL_NO_MODALITY_SYNC=1 disables it if the old single-engine generation hang
+        # (documented when projector+LoRA weights were first synced) recurs.
+        _mm_gate = getattr(self.model, "modalities_manager", None)
+        _projector_trainable = False
+        if _mm_gate is not None:
+            for _mid, _role, _mod in _mm_gate.iter_handler_modules():
+                if isinstance(_mod, torch.nn.Module) and any(p.requires_grad for p in _mod.parameters()):
+                    _projector_trainable = True
+                    break
+        sync_modality_under_lora = (
+            _projector_trainable or os.environ.get("SKYRL_SYNC_MODALITY_UNDER_LORA", "0") == "1"
+        ) and os.environ.get("SKYRL_NO_MODALITY_SYNC", "0") != "1"
         if self._is_lora:
             assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
 
-            # assume base model is already synced, sync LoRA adapters
-            lora_sync_path = self.cfg.trainer.policy.model.lora.lora_sync_path
-            await self._save_lora_adapters_and_sync(peft_model, lora_sync_path, inference_engine_client)
-            return
+            # vLLM ignores LoRA on the prompt_embeds path, so instead of syncing an adapter we merge
+            # the LoRA delta into the base weights and overwrite vLLM's base model with the result.
+            await self._merge_lora_into_base_and_broadcast(peft_model, inference_engine_client, generator_dtype)
+            if not sync_modality_under_lora:
+                return
+            # Fall through to sync the co-trained modality projector too (true on-policy). Base
+            # params are covered by the merged broadcast above, so leave `params` empty.
+            params = {}
         else:
             # Regular model without LoRA
             params = {
@@ -183,8 +348,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             }
 
         modality_params = []
-        modality_base_module = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
-        modalities_manager = getattr(modality_base_module, "modalities_manager", None)
+        # BUGFIX: modalities_manager lives on the HFModelWrapper (self.model), NOT on the inner
+        # FSDP-wrapped HF module. Reading it off self.model.model (or its _fsdp_wrapped_module)
+        # always returned None, so the co-trained projector was silently never collected/synced to
+        # vLLM -> rollouts kept the stale SFT projector -> flat reward on the overfit sanity test.
+        modalities_manager = getattr(self.model, "modalities_manager", None)
         if modalities_manager is not None:
             for modality_id, role, module in modalities_manager.iter_handler_modules():
                 if not isinstance(module, torch.nn.Module):
@@ -307,18 +475,29 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             torch.distributed.barrier()
             torch.cuda.synchronize()
 
-            if modality_params and torch.distributed.get_rank() == 0:
+            if modality_params:
+                from torch.multiprocessing.reductions import reduce_tensor
+
                 weights_update_request = {"names": [], "dtypes": [], "shapes": [], "extras": []}
                 for name, param in modality_params:
+                    # BUGFIX: projector params are FSDP-ignored (replicated full tensor on every
+                    # rank), so each rank must build an IPC handle for its OWN GPU and we all-gather
+                    # them, exactly like the base-weight path above. Previously only rank-0's GPU
+                    # handle was sent, so the other engines KeyError'd (vllm_engine.py:180) / kept
+                    # the stale projector -> at most 1/N rollouts saw the trained projector.
                     tensor = param.data.to(generator_dtype).contiguous()
-                    from torch.multiprocessing.reductions import reduce_tensor
-
-                    ipc_handle = reduce_tensor(tensor)
-                    weights_update_request["names"].append(name)
-                    weights_update_request["dtypes"].append(self.cfg.generator.model_dtype)
-                    weights_update_request["shapes"].append(list(param.shape))
-                    weights_update_request["extras"].append({"ipc_handles": {get_physical_gpu_id(): ipc_handle}})
-                if weights_update_request["names"]:
+                    ipc_handle = {get_physical_gpu_id(): reduce_tensor(tensor)}
+                    ipc_handle_list = [None] * torch.distributed.get_world_size()
+                    torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
+                    if torch.distributed.get_rank() == 0:
+                        ipc_handles = {}
+                        for d in ipc_handle_list:
+                            ipc_handles.update(d)
+                        weights_update_request["names"].append(name)
+                        weights_update_request["dtypes"].append(self.cfg.generator.model_dtype)
+                        weights_update_request["shapes"].append(list(param.shape))
+                        weights_update_request["extras"].append({"ipc_handles": ipc_handles})
+                if torch.distributed.get_rank() == 0 and weights_update_request["names"]:
                     await asyncio.create_task(inference_engine_client.update_named_weights(weights_update_request))
                     torch.cuda.ipc_collect()
             torch.distributed.barrier()

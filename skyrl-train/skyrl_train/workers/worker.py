@@ -742,6 +742,76 @@ class PolicyWorkerBase(Worker):
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
         rollout_action_logprobs = experience.rollout_logprobs
+
+        # --- one-time TIS per-token dump (gated by SKYRL_DUMP_TIS) ---
+        # Saves response token ids + train logprobs + vLLM rollout logprobs, all aligned
+        # (response tokens = sequences[:, -num_actions:]), so we can visualize offline
+        # exactly which tokens TIS caps (train >2x more confident than vLLM) vs downweights.
+        if os.environ.get("SKYRL_DUMP_TIS") and self.cfg.trainer.algorithm.use_tis and rollout_action_logprobs is not None:
+            try:
+                rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            except Exception:
+                rank0 = True
+            # Full dump at a few global steps (early/mid/later) so we can see whether the
+            # divergence tail GROWS as the projector/LoRA drift (=> fixable skew) or stays
+            # flat (=> inherent numerics floor). Step suffix keeps each snapshot.
+            _dump_steps = {1, 8, 16, 24}
+            _already = getattr(self, "_tis_dumped_steps", set())
+            if rank0 and int(global_step) in _dump_steps and int(global_step) not in _already:
+                _already.add(int(global_step)); self._tis_dumped_steps = _already
+                na = int(num_actions) if not torch.is_tensor(num_actions) else int(num_actions.max())
+                # Capture FULL context so we can replay the exact forward offline and compute a
+                # third, independent reference logprob (clean HF forward w/ canonical cell inject)
+                # to attribute the train/rollout divergence to the correct side (FSDP vs vLLM).
+                dump = {
+                    "resp_ids": sequences[:, -na:].detach().cpu(),
+                    "sequences": sequences.detach().cpu(),
+                    "attention_mask": attention_mask.detach().cpu() if attention_mask is not None else None,
+                    "num_actions": na,
+                    "old_lp": old_action_log_probs.detach().float().cpu(),
+                    "rollout_lp": rollout_action_logprobs.detach().float().cpu(),
+                    "loss_mask": loss_mask.detach().float().cpu(),
+                    "advantages": advantages.detach().float().cpu(),
+                    "temperature": float(self.cfg.generator.sampling_params.temperature),
+                    "cap": float(self.cfg.trainer.algorithm.tis_imp_ratio_cap),
+                }
+                # cell/modality metadata (the injected embedding) — best-effort, may hold tensors
+                try:
+                    md = experience.metadata.get("modalities_metadata") if experience.metadata is not None else None
+                    def _to_cpu(o):
+                        if torch.is_tensor(o): return o.detach().cpu()
+                        if isinstance(o, dict): return {k: _to_cpu(v) for k, v in o.items()}
+                        if isinstance(o, (list, tuple)): return [_to_cpu(v) for v in o]
+                        return o
+                    dump["modalities_metadata"] = _to_cpu(md)
+                except Exception as _e:
+                    dump["modalities_metadata_error"] = str(_e)
+                dump["global_step"] = int(global_step)
+                _base = os.environ.get("SKYRL_DUMP_TIS_PATH", "/home/parsaidp/SkyRL/tis_dump.pt")
+                _p = _base.replace(".pt", f"_step{int(global_step)}.pt")
+                torch.save(dump, _p)
+                print(f"[tis-dump] wrote {_p} step={int(global_step)} seq={tuple(dump['sequences'].shape)} na={na} "
+                      f"has_modmeta={dump.get('modalities_metadata') is not None}", flush=True)
+
+        # --- lightweight per-step on-policy tail tracker (always on when TIS active) ---
+        # Logs how much the vLLM rollout and FSDP recompute disagree, every step, so we can
+        # see WHERE/WHEN the divergence changes over training (growing tail => fixable skew).
+        if self.cfg.trainer.algorithm.use_tis and rollout_action_logprobs is not None:
+            try:
+                _r0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            except Exception:
+                _r0 = True
+            if _r0:
+                with torch.no_grad():
+                    _lm = loss_mask > 0
+                    _d = (old_action_log_probs - rollout_action_logprobs)[_lm].float().abs()
+                    if _d.numel() > 0:
+                        _tail = (_d > 2.0).float().mean().item()
+                        _med = _d.median().item()
+                        _p99 = _d.quantile(0.99).item() if _d.numel() > 1 else _d.item()
+                        print(f"[onpolicy-hook] step={int(global_step)} median|Δ|={_med:.4f} "
+                              f"p99|Δ|={_p99:.3f} tail(|Δ|>2)={_tail*100:.2f}% n={_d.numel()}", flush=True)
+
         modalities_metadata = None
         if experience.metadata is not None:
             modalities_metadata = experience.metadata.get("modalities_metadata")
@@ -899,15 +969,41 @@ class PolicyWorkerBase(Worker):
         if supports_modalities and modalities_metadata is not None:
             model_kwargs["modalities_metadata"] = modalities_metadata
 
-        with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            policy_logprob = self.model(
-                sequences,
-                response_length,
-                attention_mask,
-                return_output=False,
-                temperature=self.cfg.generator.sampling_params.temperature,
-                **model_kwargs,
-            )
+        # Patch A (gated, EXPERIMENTAL): compute old_log_probs with the LoRA adapter MERGED into the
+        # base, so the reference forward uses the SAME merged-bf16 weights vLLM used at rollout
+        # (kills the H2 merged-vs-adapter term in the TIS ratio). Off by default; correctness under
+        # FSDP sharding is unverified, so it self-checks and falls back if merge/unmerge fails.
+        _merge_for_lp = (
+            os.environ.get("SKYRL_MERGE_FOR_LOGPROB", "0") == "1"
+            and getattr(self, "_is_lora", False)
+        )
+        _peft = None
+        if _merge_for_lp:
+            _peft = getattr(getattr(self.model, "model", None), "_fsdp_wrapped_module", getattr(self.model, "model", None))
+            if not hasattr(_peft, "merge_adapter"):
+                _peft = None
+        if _peft is not None:
+            try:
+                _peft.merge_adapter()
+            except Exception as _e:
+                print(f"[patchA] merge_adapter failed, falling back to adapter path: {_e}", flush=True)
+                _peft = None
+        try:
+            with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
+                policy_logprob = self.model(
+                    sequences,
+                    response_length,
+                    attention_mask,
+                    return_output=False,
+                    temperature=self.cfg.generator.sampling_params.temperature,
+                    **model_kwargs,
+                )
+        finally:
+            if _peft is not None:
+                try:
+                    _peft.unmerge_adapter()
+                except Exception as _e:
+                    print(f"[patchA] unmerge_adapter FAILED (model may be corrupted!): {_e}", flush=True)
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(
             {"output": policy_logprob},

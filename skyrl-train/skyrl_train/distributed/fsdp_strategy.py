@@ -280,14 +280,25 @@ class FSDPStrategy(DistributedStrategy):
                 forward_prefetch=False,
                 ignored_modules=ignored_modules or None,
             )
-            # FSDP does not move/sync ignored (replicated) modality params. Put them on
-            # the local GPU and, for trainable ones, all-reduce grads across the DP group
-            # so every rank applies the same projection update.
+            # FSDP does not move/sync ignored (replicated) modality params: sync_module_states
+            # leaves them on meta on non-zero ranks. Rank 0 keeps its real cell_projection.pt
+            # weights; other ranks materialize empty; then broadcast rank-0's weights to all so
+            # every replica is identical. For trainable params we all-reduce grads across the DP
+            # group so every rank applies the same projection update.
             if ignored_modules:
+                import torch.distributed as dist
+
                 _dev = torch.cuda.current_device()
                 _group = self.device_mesh.get_group() if self.device_mesh is not None else None
+                _rank = dist.get_rank(_group) if dist.is_initialized() else 0
                 for _mod in ignored_modules:
-                    _mod.to(_dev)
+                    if _rank == 0:
+                        _mod.to(_dev)
+                    else:
+                        _mod.to_empty(device=_dev)
+                    if dist.is_initialized() and dist.get_world_size(_group) > 1:
+                        for _t in list(_mod.parameters()) + list(_mod.buffers()):
+                            dist.broadcast(_t.data, src=0, group=_group)
                     for _p in _mod.parameters():
                         if _p.requires_grad:
                             _p.register_post_accumulate_grad_hook(_make_modality_grad_allreduce_hook(_group))

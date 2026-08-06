@@ -192,7 +192,25 @@ class WorkerWrap:
                 weight_list.append((name, weight))
 
         if weight_list:
-            self.model_runner.model.load_weights(weights=weight_list)
+            loaded = self.model_runner.model.load_weights(weights=weight_list)
+            if not getattr(self, "_ipc_load_logged", 0) or getattr(self, "_ipc_load_logged", 0) < 3:
+                self._ipc_load_logged = getattr(self, "_ipc_load_logged", 0) + 1
+                try:
+                    nloaded = len(loaded) if loaded is not None else -1
+                except TypeError:
+                    nloaded = -2
+                n0, w0 = weight_list[0]
+                logger.warning(
+                    f"[ipc-load] sent={len(weight_list)} e.g.={n0} incoming_norm={w0.float().norm().item():.3f} "
+                    f"load_weights_returned={nloaded}"
+                )
+                if self._ipc_load_logged == 1:
+                    try:
+                        pnames = [k for k, _ in self.model_runner.model.named_parameters()]
+                        sample = [k for k in pnames if "layers.0." in k and "proj" in k][:6]
+                        logger.warning(f"[ipc-load] vLLM total_params={len(pnames)} first={pnames[:3]} layer0_proj_sample={sample}")
+                    except Exception as e:
+                        logger.warning(f"[ipc-load] param dump failed: {e}")
 
             for weight in weight_list:
                 del weight
@@ -229,9 +247,36 @@ def _apply_bioreason_vllm_overrides(kwargs: dict) -> None:
             if rope and isinstance(rope, dict):
                 rope.pop("mrope_section", None)
                 rope.pop("mrope_interleaved", None)
+            # Multimodal cell path (SKYRL_USE_MM_CELL=1): force the custom architecture so vLLM
+            # builds Qwen3_5CellForConditionalGeneration (cell modality) instead of the base LM.
+            if os.environ.get("SKYRL_USE_MM_CELL") == "1":
+                cfg.architectures = ["Qwen3_5CellForConditionalGeneration"]
             return cfg
 
         kwargs["hf_overrides"] = _disable_mrope
+
+
+_MM_CELL_REGISTERED = False
+
+
+def _maybe_setup_mm_cell(kwargs: dict) -> None:
+    """When SKYRL_USE_MM_CELL=1: register the custom multimodal cell vLLM model and set the
+    engine kwargs it needs. Gated + idempotent (registers once); a no-op when the flag is unset,
+    so the prompt_embeds path is byte-for-byte unchanged.
+    """
+    if os.environ.get("SKYRL_USE_MM_CELL") != "1":
+        return
+    global _MM_CELL_REGISTERED
+    if not _MM_CELL_REGISTERED:
+        from vllm import ModelRegistry
+
+        ModelRegistry.register_model(
+            "Qwen3_5CellForConditionalGeneration",
+            "bioreason_cell.models.vllm_cell_mm:Qwen3_5CellForConditionalGeneration",
+        )
+        _MM_CELL_REGISTERED = True
+    kwargs.setdefault("enable_mm_embeds", True)
+    kwargs.setdefault("limit_mm_per_prompt", {"cell": 1})
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
@@ -471,6 +516,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         modality_batches: Optional[Dict[str, ModalityBatch]],
         modality_metadata: Optional[List[SampleModalityData]],
     ) -> Tuple[List[Dict[str, Any]], Optional[List[SampleModalityData]]]:
+        _use_mm = os.environ.get("SKYRL_USE_MM_CELL") == "1"
         num_prompts = len(prompt_token_ids)
         metadata_list = list(modality_metadata) if modality_metadata else []
         created_metadata = False
@@ -481,6 +527,20 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         if not metadata_list:
             metadata_list = [SampleModalityData() for _ in range(num_prompts)]
             created_metadata = True
+
+        # Multimodal cell path (SKYRL_USE_MM_CELL=1): keep token_ids intact and pass the raw
+        # cell vector as `multi_modal_data`; the custom vLLM model projects + scatters it at the
+        # <|cell_pad|> placeholder. This bypasses the prompt_embeds side-door entirely.
+        if _use_mm and modality_batches and self.modalities_manager and self.modalities_manager.has_modalities():
+            raw_by_sample = self.modalities_manager.raw_features_by_sample(modality_batches)
+            prompts = []
+            for i, ids in enumerate(prompt_token_ids):
+                cell = raw_by_sample.get(i)
+                if cell is not None:
+                    prompts.append(TokensPrompt(prompt_token_ids=ids, multi_modal_data={"cell": cell}))
+                else:
+                    prompts.append(TokensPrompt(prompt_token_ids=ids))
+            return prompts, (None if created_metadata else metadata_list)
 
         replacements: Dict[int, List[Tuple[Tuple[int, int], torch.Tensor]]] = {}
         if modality_batches and self.modalities_manager and self.modalities_manager.has_modalities():
@@ -548,6 +608,13 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
                 "Please set `generator.async_engine=true` in your config."
             )
         _apply_bioreason_vllm_overrides(kwargs)
+        _maybe_setup_mm_cell(kwargs)
+        # #2 temperature-consistency: vLLM's default "raw_logprobs" ignores the sampling temperature
+        # (always T=1), but the FSDP recompute divides logits by T (model_wrapper: logits.div_(T)).
+        # "processed_logprobs" = log_softmax(logits/T) after top-k/p (a no-op here: top_k=-1, top_p=1),
+        # so rollout logprobs match the training side at ANY temperature. Identical at T=1 (our runs),
+        # fixes a silent mismatch at T!=1 and the div-by-zero NaN at T=0.
+        kwargs.setdefault("logprobs_mode", "processed_logprobs")
         return vllm.LLM(*args, **kwargs)
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
@@ -568,7 +635,12 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         if self._is_lora:
             lora_int_ids = list(self.llm.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
+                # Use the MOST RECENTLY loaded adapter. Each weight sync calls add_lora with a
+                # fresh (monotonically increasing, time-based) id; `list_loras()[0]` returns an
+                # arbitrary/oldest id, which for accumulated adapters is the step-0 (empty) one --
+                # freezing the rollout at the base model. max() = the just-synced adapter.
+                lora_int_id = max(lora_int_ids)
+                logger.info(f"[lora-gen] active_loras={sorted(lora_int_ids)} -> using newest id={lora_int_id}")
                 batch_size = len(prompt_requests)
                 # dummy_lora_path for placeholder (actual loading done in add_lora())
                 lora_requests = [
@@ -625,9 +697,18 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     async def _load_lora_from_disk(self, lora_path: str):
         """Load LoRA adapters from disk using vLLM's native add_lora method."""
+        # Remove any previously-registered adapters first so (a) they don't accumulate and (b) the
+        # freshly-synced weights are re-loaded from disk (defeats id/path caching). Without this,
+        # adapters pile up and generation can pick a stale (step-0, empty) one -> frozen rollout.
+        try:
+            for old_id in list(self.llm.llm_engine.list_loras()):
+                self.llm.llm_engine.remove_lora(old_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[lora-sync] failed to remove stale loras: {e}")
         lora_id = int(time.time_ns() % 0x7FFFFFFF)
         lora_request = LoRARequest(lora_name=f"{lora_id}", lora_int_id=lora_id, lora_path=lora_path)
         result = self.llm.llm_engine.add_lora(lora_request)
+        logger.info(f"[lora-sync] add_lora id={lora_id} from {lora_path} -> {result}")
         return result
 
     async def update_named_weights(self, request: NamedWeightsUpdateRequest):
@@ -685,6 +766,9 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     def _create_engine(self, *args, **kwargs):
         openai_kwargs = pop_openai_kwargs(kwargs)
+        _maybe_setup_mm_cell(kwargs)
+        # #2 temperature-consistency (see sync _create_engine): match FSDP's log_softmax(logits/T).
+        kwargs.setdefault("logprobs_mode", "processed_logprobs")
         # TODO (erictang000): potentially enable log requests for a debugging mode
         engine_args = vllm.AsyncEngineArgs(enable_log_requests=False, **kwargs)
         engine = vllm.AsyncLLMEngine.from_engine_args(engine_args)

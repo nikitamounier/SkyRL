@@ -235,6 +235,44 @@ class ModalitiesManager:
 
         return replacements
 
+    def raw_features_by_sample(
+        self,
+        modality_batches: Mapping[str, ModalityBatch],
+    ) -> Dict[int, torch.Tensor]:
+        """Return RAW (un-projected) encoder features keyed by sample index.
+
+        Mirrors :meth:`compute_embeddings`' encoder step but stops BEFORE the projector:
+        the projection now lives inside the custom vLLM multimodal model, so the engine
+        only needs the raw per-sample features to pass as ``multi_modal_data``. Assumes one
+        occurrence per sample (the cell modality), so later occurrences overwrite earlier
+        ones for the same sample index.
+        """
+        raw_by_sample: Dict[int, torch.Tensor] = {}
+        if not modality_batches:
+            return raw_by_sample
+
+        for modality_id, batch in modality_batches.items():
+            if modality_id not in self._handlers:
+                raise ValueError(f"Received modality `{modality_id}` which is not configured.")
+            handler_bundle = self._handlers[modality_id]
+            occurrences = batch.occurrences
+            if not occurrences:
+                continue
+
+            payloads = [occ.payload for occ in occurrences]
+            raw_features = self._run_encoder(handler_bundle, payloads)
+
+            if len(raw_features) != len(occurrences):
+                raise ValueError(
+                    f"Encoder for modality `{modality_id}` returned {len(raw_features)} tensors for "
+                    f"{len(occurrences)} occurrences."
+                )
+
+            for occ, raw in zip(occurrences, raw_features):
+                raw_by_sample[occ.sample_index] = raw
+
+        return raw_by_sample
+
     def _run_encoder(
         self,
         handler_bundle: _HandlerBundle,

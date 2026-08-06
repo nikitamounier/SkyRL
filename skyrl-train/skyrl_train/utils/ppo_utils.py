@@ -999,12 +999,34 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+        # DIAG: within-group reward variance + the ACHIEVABLE CEILING. mean-per-group-max is the
+        # best reward reachable by always picking each prompt's best-sampled answer: if a prompt never
+        # samples the correct answer, its max stays low and GRPO can never lift it. If ceiling ~= the
+        # current reward_mean, we're at the sampling ceiling (overfit impossible without better
+        # coverage); if ceiling >> reward_mean, there's real headroom and it's an optimization issue.
+        _stds = torch.tensor([float(id2std[k]) for k in id2std])
+        _means = torch.tensor([float(id2mean[k]) for k in id2mean])
+        _maxs = torch.tensor([max(float(v) for v in id2score[k]) for k in id2score])
+        _mins = torch.tensor([min(float(v) for v in id2score[k]) for k in id2score])
+        print(
+            f"[grpo-adv] groups={len(id2std)} reward_mean={_means.mean():.3f} "
+            f"CEILING(mean group-max)={_maxs.mean():.3f} frac(group has a 1.0)={(_maxs >= 0.999).float().mean():.2f} "
+            f"frac(group all-wrong,max<0.1)={(_maxs < 0.1).float().mean():.2f} "
+            f"within_group_std mean={_stds.mean():.4f} frac(std<0.01)={(_stds < 0.01).float().mean():.2f}",
+            flush=True,
+        )
+        # per-prompt accuracy (uid == dataset row index), lowest-first -> identifies HARD prompts
+        _per = sorted(((str(k), round(float(id2mean[k]), 3)) for k in id2mean), key=lambda x: x[1])
+        print(f"[grpo-adv] per-prompt (uid,mean) lowest-first: {_per}", flush=True)
         for i in range(bsz):
             if grpo_norm_by_std:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
+        _adv = scores[scores != 0]
+        if _adv.numel():
+            print(f"[grpo-adv] |advantage| mean={_adv.abs().mean():.3f} max={_adv.abs().max():.3f}", flush=True)
 
     return scores, scores
 

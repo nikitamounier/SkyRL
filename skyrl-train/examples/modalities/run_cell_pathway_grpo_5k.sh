@@ -17,6 +17,25 @@ PLACEHOLDER_TOKEN="${PLACEHOLDER_TOKEN:-<|cell_pad|>}"
 CELL_PROJ_PATH="${CELL_PROJ_PATH:-$MODEL_PATH/cell_projection.pt}"
 TRAIN_PROJECTION="${TRAIN_PROJECTION:-true}"     # co-train the cell projection
 RUN_NAME="${RUN_NAME:-cell_pathway_grpo_min5k}"
+LR="${LR:-2.0e-6}"
+USE_KL="${USE_KL:-false}"          # drop KL by default
+MAX_GEN="${MAX_GEN:-512}"
+MICRO_TRAIN="${MICRO_TRAIN:-4}"
+MICRO_FWD="${MICRO_FWD:-8}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-12288}"
+TRAIN_BATCH="${TRAIN_BATCH:-64}"
+MINI_BATCH="${MINI_BATCH:-16}"
+EPOCHS="${EPOCHS:-2}"
+EVAL_BEFORE="${EVAL_BEFORE:-false}"
+# Enable vLLM rollout logprobs so the trainer logs policy/rollout_train_prob_diff_mean =
+# exp(rollout_logprob - train_logprob) on response tokens. ~1.0 <=> inference & training stacks
+# hold identical weights (true on-policy); a large deviation flags a weight-sync mismatch.
+LOGPROBS="${LOGPROBS:-0}"   # 0 = logprob of the chosen token only (SkyRL requires 0, not >0)
+USE_PACKING="${USE_PACKING:-true}"   # sample packing; suspect for train-vs-rollout logprob mismatch
+# Restrict LoRA to standard transformer attention+MLP projections. "all-linear" also targets
+# Qwen3.5's SSM/linear-attention in_proj_*/out_proj layers, whose vLLM LoRA kernels hang during
+# generation once the delta is non-zero (the previously-empty adapter never exercised them).
+TARGET_MODULES="${TARGET_MODULES:-[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]}"
 
 python -m skyrl_train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
@@ -27,35 +46,39 @@ python -m skyrl_train.entrypoints.main_base \
   trainer.strategy=fsdp \
   trainer.policy.model.lora.rank=32 \
   trainer.policy.model.lora.alpha=32 \
+  trainer.target_modules="$TARGET_MODULES" \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.num_inference_engines=$NUM_GPUS \
   generator.inference_engine_tensor_parallel_size=1 \
-  trainer.epochs=2 \
+  trainer.epochs=$EPOCHS \
   trainer.eval_batch_size=64 \
-  trainer.eval_before_train=false \
+  trainer.eval_before_train=$EVAL_BEFORE \
   trainer.eval_interval=100000 \
   trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=64 \
-  trainer.policy_mini_batch_size=16 \
-  trainer.micro_forward_batch_size_per_gpu=8 \
-  trainer.micro_train_batch_size_per_gpu=4 \
+  trainer.train_batch_size=$TRAIN_BATCH \
+  trainer.policy_mini_batch_size=$MINI_BATCH \
+  trainer.micro_forward_batch_size_per_gpu=$MICRO_FWD \
+  trainer.micro_train_batch_size_per_gpu=$MICRO_TRAIN \
   trainer.ckpt_interval=40 \
   trainer.max_prompt_length=8192 \
-  generator.sampling_params.max_generate_length=512 \
-  generator.sampling_params.temperature=1.0 \
-  trainer.policy.optimizer_config.lr=2.0e-6 \
-  trainer.algorithm.use_kl_loss=true \
+  trainer.use_sample_packing=$USE_PACKING \
+  generator.sampling_params.max_generate_length=$MAX_GEN \
+  generator.sampling_params.temperature=${TEMP:-1.0} \
+  generator.sampling_params.logprobs=$LOGPROBS \
+  trainer.policy.optimizer_config.lr=$LR \
+  trainer.algorithm.use_kl_loss=$USE_KL \
+  trainer.algorithm.kl_loss_coef=${KL_COEF:-0.001} \
   generator.backend=$INFERENCE_BACKEND \
   generator.run_engines_locally=true \
   generator.weight_sync_backend=nccl \
   generator.async_engine=false \
   generator.batched=true \
   environment.env_class=cell_pathway \
-  generator.n_samples_per_prompt=16 \
+  generator.n_samples_per_prompt=${NSAMPLES:-16} \
   generator.gpu_memory_utilization=0.4 \
   generator.enforce_eager=true \
-  +generator.engine_init_kwargs.max_model_len=12288 \
+  +generator.engine_init_kwargs.max_model_len=$MAX_MODEL_LEN \
   +generator.engine_init_kwargs.language_model_only=true \
   +generator.engine_init_kwargs.disable_mrope=true \
   trainer.logger="$LOGGER" \

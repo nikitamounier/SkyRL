@@ -528,46 +528,46 @@ class PrecisionType:
 
 # Reference: https://github.com/volcengine/verl/blob/main/verl/utils/fsdp_utils.py
 def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+    """Collect LoRA params for checkpoint saving.
 
-    def __prefix_submodules(module, prefix):
-        for name, submodule in module.named_modules():
-            if name.startswith(prefix) and "." not in name[len(prefix) :]:
-                yield name, submodule
+    The original implementation walked a hardcoded list of module-path prefixes, which silently
+    produced an EMPTY adapter for models whose decoder layers live at an unexpected path (e.g.
+    Qwen3.5's ``base_model.model.language_model.model.layers.*``). We now delegate to the robust,
+    structure-agnostic ``collect_lora_params`` so the saved adapter is always complete.
+    """
+    return collect_lora_params(fsdp_module)
 
-    lora_params = OrderedDict()
-    prefix_list = [
-        # fsdp
-        "_fsdp_wrapped_module.base_model.model.",
-        "_fsdp_wrapped_module.base_model.model.model.",
-        "_fsdp_wrapped_module.base_model.model.model.layers.",
-        "_fsdp_wrapped_module.base_model.model.model.language_model.layers.",
-        # fsdp2
-        "base_model.model.",
-        "base_model.model.model.",
-        "base_model.model.model.layers.",
-        "base_model.model.model.language_model.layers.",
-    ]
-    peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
-    for prefix in prefix_list:
-        for name, submodule in __prefix_submodules(fsdp_module, prefix):
-            prefix = name.replace("_fsdp_wrapped_module.base_model.model.", "base_model.model.")
-            if name.endswith(".model") or name.endswith(".layers"):
-                continue
-            if fsdp_version(submodule) > 0:
-                with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
-                    sub_lora_params = {
-                        f"{prefix}.{name}": (
-                            param.full_tensor().detach().cpu()
-                            if hasattr(param, "full_tensor")
-                            else param.detach().cpu()
-                        )
-                        for name, param in sub_lora_params.items()
-                    }
-                    lora_params.update(sub_lora_params)
-                    submodule._is_root = False
-                torch.cuda.empty_cache()
-    return lora_params
+
+_LORA_KEY_MARKERS = (
+    ".lora_A.",
+    ".lora_B.",
+    ".lora_embedding_A.",
+    ".lora_embedding_B.",
+    ".lora_magnitude_vector.",
+    "lora_magnitude_vector",
+)
+
+
+def _extract_lora_named_params(named_params, adapter_name: str = "default") -> OrderedDict:
+    """Structure-agnostic extraction of LoRA params from a (name, tensor) iterator.
+
+    Unlike ``get_peft_model_state_dict``/``layered_summon_lora_params`` — which rely on the exact
+    PeftModel object or on a hardcoded module-path prefix list — this simply scans every parameter
+    name for a LoRA marker and normalizes it to PEFT adapter format (FSDP wrapper segments and the
+    adapter name stripped), so it works regardless of how deeply the decoder layers are nested (e.g.
+    Qwen3.5's ``base_model.model.language_model.model.layers.*`` path, which matches none of the
+    hardcoded prefixes and silently produced an EMPTY adapter -> frozen rollout).
+    """
+    out = OrderedDict()
+    for name, v in named_params:
+        if not any(m in name for m in _LORA_KEY_MARKERS):
+            continue
+        nk = name.replace("_fsdp_wrapped_module.", "")
+        nk = nk.replace(f".{adapter_name}.", ".")
+        if hasattr(v, "full_tensor"):
+            v = v.full_tensor()
+        out[nk] = v.detach().cpu()
+    return out
 
 
 def collect_lora_params(module: FSDP) -> OrderedDict:
@@ -575,17 +575,20 @@ def collect_lora_params(module: FSDP) -> OrderedDict:
     collect lora params or full params if base model is not ready in vllm
     requires `module._fsdp_wrapped_module` to be a `PeftModel`
     """
-    lora_params = OrderedDict()
-    peft_model = getattr(module, "_fsdp_wrapped_module", module)
     if fsdp_version(module) > 0:
         with FSDP.summon_full_params(module, writeback=False):
-            # If base model is synced, we can get the full state dict from peft model
-            lora_params = get_peft_model_state_dict(peft_model)
-            lora_params = {
-                name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
-                for name, param in lora_params.items()
-            }
+            # summon materializes full (unsharded) params in-place; iterate named_parameters
+            # directly (predictable under FSDP regardless of the active state_dict_type) and
+            # filter for LoRA tensors.
+            lora_params = _extract_lora_named_params(list(module.named_parameters()))
         torch.cuda.empty_cache()
     else:
-        lora_params = get_peft_model_state_dict(peft_model)
+        lora_params = _extract_lora_named_params(list(module.named_parameters()))
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
+        n = len(lora_params)
+        assert n > 0, (
+            "collect_lora_params extracted 0 LoRA tensors — the adapter synced to vLLM would be "
+            "empty and the rollout would stay frozen at the base model. Check the module structure."
+        )
+        print(f"[collect_lora_params] extracted {n} LoRA tensors for inference sync", flush=True)
     return lora_params
